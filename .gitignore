@@ -1,0 +1,11 @@
+# Sistema operativo / editores
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+
+# Datos exportados por el panel durante pruebas
+*.csv
