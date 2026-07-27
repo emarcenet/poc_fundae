@@ -17,221 +17,76 @@
  * el editor de Moodle elimina las etiquetas <style> al guardar.
  * ============================================================ */
 /* SEGURIDAD: el panel NO lleva ningún token incrustado en el código.
- * Cada tutor se conecta con su token PERSONAL (Preferencias → Claves de
- * seguridad), que se guarda solo en SU navegador — sessionStorage por
- * defecto (se borra al cerrar) o localStorage si marca «Recordar» — y
- * consulta la API con sus propios permisos: si se filtra, no concede
- * más acceso del que ese tutor ya tiene. */
-var TOKEN_KEY = 'fundae_wstoken';
-var SERVICE_NAME = 'FUNDAE PoC'; // nombre del servicio externo en Moodle
+ * Cada tutor se conecta con su token PERSONAL del servicio SERVICE_NAME,
+ * que se guarda solo en SU navegador y consulta la API con sus propios
+ * permisos: si se filtra, no concede más acceso del que ese tutor ya tiene.
+ *
+ * La generación del token NUNCA es automática: regenerarlo invalida el
+ * anterior, así que es una acción destructiva y requiere un clic explícito
+ * del tutor. El panel solo toca el token del servicio SERVICE_NAME; si no
+ * existe una fila para ese servicio, no toca ningún otro token.
+ *
+ * DATOS PERSONALES: el panel muestra y exporta nombre, correo y patrón
+ * horario de conexión del alumnado. Ver la sección RGPD del README antes
+ * de distribuir los CSV que genera. */
+
+/* ------------------------------------------------------------------ */
+/* Configuración                                                       */
+/* ------------------------------------------------------------------ */
+
+var SERVICE_NAME = 'FUNDAE PoC'; // nombre EXACTO del servicio externo en Moodle
 var MAX_ALUMNOS = 100;     // límite de alumnos consultados en la PoC
 var SESSION_GAP_MIN = 30;  // minutos de inactividad que cierran una sesión
+var SESSION_MIN_SEC = 60;  // tiempo atribuido a una sesión de un solo evento
+var CONCURRENCY = 5;       // peticiones simultáneas máximas contra Moodle
+var RETRIES = 3;           // reintentos ante error de red o 429/5xx
 
-// Por defecto el token vive en sessionStorage (se borra al cerrar el
-// navegador). Solo si el tutor marca «Recordar en este navegador» pasa
-// a localStorage (persistente hasta que lo borre).
+// Shortnames de rol que se consideran alumnado. Se amplía aquí cuando el
+// cliente ha renombrado o clonado el rol (habitual en instalaciones en
+// español); además se acepta cualquier rol cuyo shortname empiece por
+// «student» o «alumn».
+var STUDENT_ROLES = ['student', 'alumno', 'alumna', 'alumnado', 'estudiante'];
+
+var TOKEN_KEY = 'fundae_wstoken';
+var TOKEN_MODE_KEY = 'fundae_wstoken_mode'; // 'local' | 'session'
+
+/* ------------------------------------------------------------------ */
+/* Almacenamiento del token                                            */
+/* ------------------------------------------------------------------ */
+
+// Por defecto el token vive en localStorage: es el ÚNICO almacenamiento
+// compartido entre pestañas. Con sessionStorage cada pestaña arrancaría sin
+// token y regeneraría el suyo, invalidando el de las demás. Marcar «solo
+// esta sesión» lo devuelve a sessionStorage a cambio de reconectar a diario.
+// El modelo de amenazas no cambia: un XSS lee ambos por igual (README).
 function getToken() {
-  try { return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; }
+  try { return localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; }
 }
-function setToken(t, remember) {
+function setToken(t, sessionOnly) {
   try {
     sessionStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(TOKEN_KEY);
-    if (t) (remember ? localStorage : sessionStorage).setItem(TOKEN_KEY, t);
-  } catch (e) {}
-}
-
-var fundaeData = { students: [], sortKey: 'name', sortDir: 1, expanded: {}, expandedType: {} };
-
-/* --- Inyección de estilos (el editor de Moodle purga <style>) --- */
-(function () {
-  var css = [
-    '#fundae-panel{max-width:1140px;margin:0 auto;--fp-blue:#0f6cbf;--fp-purple:#5b3fc5;}',
-
-    '#fundae-panel .fp-hero{background:linear-gradient(120deg,#0f6cbf 0%,#5b3fc5 100%);color:#fff;border-radius:14px;padding:16px 20px;margin-bottom:16px;box-shadow:0 4px 18px rgba(30,50,110,.18);}',
-    '#fundae-panel .fp-hero-top{display:flex;flex-wrap:wrap;align-items:center;gap:10px;}',
-    '#fundae-panel .fp-hero h2{margin:0;font-weight:700;font-size:1.4rem;letter-spacing:-.01em;color:#fff;flex:1 1 auto;}',
-    '#fundae-panel .fp-hero .fp-sub{opacity:.85;font-size:.85em;margin-top:4px;}',
-    '#fundae-panel .fp-hero .fp-chips{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;}',
-    '#fundae-panel .fp-chip{background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.25);border-radius:50rem;padding:2px 12px;font-size:.78em;}',
-    '#fundae-panel .fp-toolbar{display:flex;flex-wrap:wrap;gap:6px;}',
-    '#fundae-panel .fp-toolbar .btn{border-radius:50rem;font-size:.8em;padding:3px 14px;}',
-    '#fundae-panel .fp-btn-light{background:#fff;color:#0f6cbf;border:1px solid #fff;}',
-    '#fundae-panel .fp-btn-ghost{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.6);}',
-    '#fundae-panel .fp-btn-ghost:hover{background:rgba(255,255,255,.15);color:#fff;}',
-    '#fundae-panel .fp-btn-save{background:#0f6cbf;color:#fff;border:1px solid #0f6cbf;border-radius:50rem;font-size:.85em;padding:5px 18px;}',
-    '#fundae-panel .fp-btn-save:hover{background:#0c5aa0;color:#fff;}',
-    '#fundae-panel .fp-btn-del{background:#fff;color:#b3261e;border:1px solid #b3261e;border-radius:50rem;font-size:.85em;padding:5px 18px;}',
-
-    '#fundae-panel .fp-card{border:0;border-radius:14px;background:#fff;box-shadow:0 2px 10px rgba(25,40,80,.08);margin-bottom:18px;}',
-    '#fundae-panel .fp-card .card-body{padding:20px 22px;}',
-    '#fundae-panel .fp-card h5{font-weight:700;display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap;}',
-    '#fundae-panel .fp-card h5 .fp-h-ic{width:32px;height:32px;border-radius:10px;display:inline-flex;align-items:center;justify-content:center;font-size:1rem;background:rgba(15,108,191,.12);}',
-
-    '#fundae-panel .fp-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px;}',
-    '#fundae-panel .fp-kpi{text-align:center;padding:12px 8px 10px;margin-bottom:0;}',
-    '#fundae-panel .fp-kpi .fp-ic{width:36px;height:36px;margin:0 auto 6px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.05rem;background:linear-gradient(135deg,rgba(15,108,191,.14),rgba(91,63,197,.14));}',
-    '#fundae-panel .fp-kpi .fp-num{font-size:1.4em;font-weight:800;line-height:1.1;color:#1d2b45;}',
-    '#fundae-panel .fp-kpi .fp-lbl{color:#7a8699;font-size:.7em;text-transform:uppercase;letter-spacing:.06em;margin-top:2px;}',
-
-    '#fundae-panel table{font-size:.95em;width:100%;}',
-    '#fundae-panel table thead th{border-top:0;border-bottom:2px solid #eef1f6;color:#7a8699;font-size:.78em;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap;padding:9px 10px;}',
-    '#fundae-panel table td{vertical-align:middle;border-color:#f1f3f8;padding:9px 10px;}',
-    '#fundae-panel th.fp-sortable{cursor:pointer;user-select:none;}',
-    '#fundae-panel th.fp-sortable:hover{color:#0f6cbf;}',
-    '#fundae-panel .fp-scroll{max-height:480px;overflow:auto;}',
-    '#fundae-panel .fp-scroll thead th{position:sticky;top:0;background:#fff;z-index:1;}',
-
-    '#fundae-panel .badge{border-radius:50rem;padding:.35em .8em;font-weight:600;}',
-    '#fundae-panel .fp-ok{background:#1b7e2c;color:#fff;}',
-    '#fundae-panel .fp-warn{background:#f5c211;color:#3d3000;}',
-    '#fundae-panel .fp-fail{background:#b3261e;color:#fff;}',
-    '#fundae-panel .fp-neutral{background:#e4e8f0;color:#43506b;}',
-    '#fundae-panel .fp-info{background:#cfe6f8;color:#0b4a7a;}',
-
-    '#fundae-panel .progress{border-radius:50rem;height:16px;background:#eef1f6;min-width:110px;overflow:hidden;display:flex;}',
-    '#fundae-panel .progress-bar{font-size:.72em;font-weight:700;border-radius:50rem;color:#fff;display:flex;align-items:center;justify-content:center;}',
-    '#fundae-panel .fp-bar-ok{background:#1b7e2c;}#fundae-panel .fp-bar-warn{background:#d99e00;}#fundae-panel .fp-bar-fail{background:#b3261e;}',
-
-    '#fundae-panel .fp-av{width:32px;height:32px;border-radius:50%;display:inline-flex;flex:0 0 32px;align-items:center;justify-content:center;color:#fff;font-size:.72em;font-weight:700;}',
-    '#fundae-panel .fp-stu{display:flex;align-items:center;gap:10px;}',
-
-    '#fundae-panel a.fp-tg{color:inherit;text-decoration:none;font-weight:600;}',
-    '#fundae-panel a.fp-tg:hover{color:#0f6cbf;}',
-    '#fundae-panel .fp-car{display:inline-block;transition:transform .15s;color:#0f6cbf;}',
-    '#fundae-panel .fp-car.open{transform:rotate(90deg);}',
-    '#fundae-panel tr.fp-detail > td{background:#f8fafd;}',
-
-    '#fundae-panel .fp-links{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;}',
-    '#fundae-panel .fp-link{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:12px;border:1px solid #e7ebf3;text-decoration:none;color:#1d2b45;background:#fff;transition:box-shadow .15s,transform .15s;}',
-    '#fundae-panel .fp-link:hover{box-shadow:0 4px 14px rgba(25,40,80,.12);transform:translateY(-1px);text-decoration:none;color:#1d2b45;}',
-    '#fundae-panel .fp-link .fp-l-ic{width:36px;height:36px;border-radius:10px;flex:0 0 36px;display:flex;align-items:center;justify-content:center;font-size:1.05rem;background:rgba(15,108,191,.1);}',
-    '#fundae-panel .fp-link b{font-size:.85em;display:block;line-height:1.2;}',
-    '#fundae-panel .fp-link small{color:#7a8699;font-size:.72em;}',
-
-    '#fundae-panel .fp-muted{color:#7a8699;font-size:.85em;}',
-    '#fundae-panel .fp-error{padding:14px 16px;background:#fdecea;border:1px solid #f2b8b5;color:#8c1d18;border-radius:12px;}',
-    '#fundae-panel .fp-filter{max-width:230px;margin-left:auto;border-radius:50rem;border:1px solid #dde3ee;padding:4px 14px;font-size:.85em;}',
-
-    '@media print{#fundae-panel .fp-noprint{display:none !important;}',
-    '#fundae-panel .fp-hero{background:#fff !important;color:#000;border:1px solid #ddd;box-shadow:none;}',
-    '#fundae-panel .fp-hero h2{color:#000;}',
-    '#fundae-panel .fp-chip{border-color:#bbb;background:#f5f5f5;}',
-    '#fundae-panel .fp-card{box-shadow:none;border:1px solid #ddd;}',
-    '#fundae-panel .fp-scroll{max-height:none;overflow:visible;}}'
-  ].join('\n');
-  var tag = document.createElement('style');
-  tag.textContent = css;
-  document.head.appendChild(tag);
-
-  // Esqueleto: cabecera hero + contenedor del cuerpo, generados desde JS.
-  var root = document.getElementById('fundae-panel');
-  root.innerHTML =
-    '<div class="fp-hero">' +
-    '<div class="fp-hero-top">' +
-    '<h2>📋 Panel de evidencias FUNDAE</h2>' +
-    '<div class="fp-toolbar fp-noprint">' +
-    '<button class="btn btn-sm fp-btn-light" onclick="fundaeRun()">⟳ Actualizar</button>' +
-    '<button class="btn btn-sm fp-btn-ghost" onclick="fundaeCsv()">⬇ CSV resumen</button>' +
-    '<button class="btn btn-sm fp-btn-ghost" onclick="fundaeCsvDays()">⬇ CSV por días</button>' +
-    '<button class="btn btn-sm fp-btn-ghost" onclick="window.print()">🖨 Imprimir</button>' +
-    '<button class="btn btn-sm fp-btn-ghost" onclick="fundaeTokenSetup()" title="Cambiar o borrar el token guardado en este navegador">🔑</button>' +
-    '</div></div>' +
-    '<div class="fp-sub">Seguimiento de teleformación bonificada · trazabilidad, evaluación y tutorización</div>' +
-    '<div class="fp-chips" id="fp-chips"><span class="fp-chip">Cargando curso…</span></div>' +
-    '<div class="fp-sub" id="fp-timestamp"></div>' +
-    '</div>' +
-    '<div id="fp-body"></div>';
-})();
-
-function fundaeCourseId() {
-  var m = location.pathname.match(/course\/view\.php/) && location.search.match(/[?&]id=(\d+)/);
-  if (m) return parseInt(m[1], 10);
-  var bc = document.body.className.match(/course-(\d+)/);
-  if (bc) return parseInt(bc[1], 10);
-  return null;
-}
-
-function ws(fn, args) {
-  var body = new URLSearchParams();
-  body.set('wstoken', getToken());
-  body.set('wsfunction', fn);
-  body.set('moodlewsrestformat', 'json');
-  Object.keys(args || {}).forEach(function (k) { body.set(k, args[k]); });
-  return fetch(M.cfg.wwwroot + '/webservice/rest/server.php', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString()
-  }).then(function (r) { return r.json(); }).then(function (j) {
-    if (j && j.exception) {
-      var err = new Error(j.message || j.errorcode);
-      err.errorcode = j.errorcode || '';
-      throw err;
+    if (t) {
+      (sessionOnly ? sessionStorage : localStorage).setItem(TOKEN_KEY, t);
+      localStorage.setItem(TOKEN_MODE_KEY, sessionOnly ? 'session' : 'local');
     }
-    return j;
-  });
+  } catch (e) { /* almacenamiento bloqueado: el panel seguirá pidiendo el token */ }
 }
 
-/* --- Tiempo de conexión desde report/log (sesión del tutor) --- */
+var fundaeData = {
+  students: [], sortKey: 'name', sortDir: 1, expanded: {}, expandedType: {},
+  dateOrder: null, csvWarned: false
+};
 
-function fundaeLogTimestamps(courseid, userid) {
-  var p = new URLSearchParams({
-    chooselog: 1, id: courseid, user: userid, date: 0,
-    modid: '', modaction: '', origin: '', edulevel: -1,
-    logreader: 'logstore_standard', download: 'json'
-  });
-  return fetch(M.cfg.wwwroot + '/report/log/index.php?' + p.toString(), { credentials: 'same-origin' })
-    .then(function (r) { return r.text(); })
-    .then(function (txt) {
-      var rows;
-      try { rows = JSON.parse(txt); } catch (e) { return null; } // sin permiso → HTML, no JSON
-      if (!Array.isArray(rows)) return null;
-      var ts = [];
-      rows.forEach(function (row) {
-        // Primera columna = hora del evento, formato numérico "d/m/yy, HH:MM(:SS)".
-        var v = row[Object.keys(row)[0]];
-        var m = String(v).match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})\D+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-        if (!m) return;
-        var y = parseInt(m[3], 10); if (y < 100) y += 2000;
-        ts.push(new Date(y, parseInt(m[2], 10) - 1, parseInt(m[1], 10),
-          parseInt(m[4], 10), parseInt(m[5], 10), parseInt(m[6] || '0', 10)).getTime() / 1000);
-      });
-      return ts;
-    })
-    .catch(function () { return null; });
-}
+/* ------------------------------------------------------------------ */
+/* Utilidades                                                          */
+/* ------------------------------------------------------------------ */
 
-// Reconstruye sesiones a partir de timestamps con el umbral de inactividad.
-function fundaeSessions(ts) {
-  if (!ts || !ts.length) return { seconds: 0, sessions: 0, list: [] };
-  ts = ts.slice().sort(function (a, b) { return a - b; });
-  var gap = SESSION_GAP_MIN * 60;
-  var list = [], start = ts[0], prev = ts[0];
-  for (var i = 1; i < ts.length; i++) {
-    if (ts[i] - prev > gap) { list.push({ start: start, end: prev, seconds: prev - start }); start = ts[i]; }
-    prev = ts[i];
-  }
-  list.push({ start: start, end: prev, seconds: prev - start });
-  var total = list.reduce(function (a, sn) { return a + sn.seconds; }, 0);
-  return { seconds: total, sessions: list.length, list: list };
-}
-
-// Agrupa las sesiones por día natural (clave aaaa-mm-dd, por fecha de inicio).
-function fundaeByDay(list) {
-  var days = {};
-  list.forEach(function (sn) {
-    var d = new Date(sn.start * 1000);
-    var key = d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2);
-    if (!days[key]) days[key] = { day: key, seconds: 0, sessions: 0 };
-    days[key].seconds += sn.seconds;
-    days[key].sessions++;
-  });
-  return Object.keys(days).sort().map(function (k) { return days[k]; });
-}
-
+// Escapa también la comilla simple y la barra: el panel construye HTML por
+// concatenación y algunos atributos podrían usar comillas simples.
 function esc(s) {
-  return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
-    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+  return String(s == null ? '' : s).replace(/[&<>"'/]/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '/': '&#47;' }[c];
   });
 }
 function fmtDate(ts) { return ts ? new Date(ts * 1000).toLocaleString() : '—'; }
@@ -247,22 +102,254 @@ function avatar(name) {
   for (var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 9973;
   var parts = name.trim().split(/\s+/);
   var ini = (parts[0] ? parts[0][0] : '?') + (parts[1] ? parts[1][0] : '');
-  return '<span class="fp-av" style="background:' + colors[h % colors.length] + '">' + esc(ini.toUpperCase()) + '</span>';
+  return '<span class="fp-av" aria-hidden="true" style="background:' + colors[h % colors.length] + '">' +
+    esc(ini.toUpperCase()) + '</span>';
 }
-function car(open) { return '<span class="fp-car' + (open ? ' open' : '') + '">▸</span> '; }
+function car(open) {
+  return '<span class="fp-car' + (open ? ' open' : '') + '" aria-hidden="true">▸</span> ';
+}
+// Emoji decorativo: se oculta a los lectores de pantalla, que ya leen el texto.
+function ic(e) { return '<span aria-hidden="true">' + e + '</span>'; }
+
+// Pool de concurrencia: evita lanzar cientos de peticiones a la vez contra
+// Moodle. Las descargas de report/log son consultas caras; sin límite, un
+// curso de 100 alumnos puede dejar el sitio sin responder.
+function fundaePool(items, worker, limit, onProgress) {
+  var results = new Array(items.length);
+  var next = 0, done = 0, active = 0;
+  return new Promise(function (resolve) {
+    if (!items.length) return resolve(results);
+    function run(i) {
+      Promise.resolve()
+        .then(function () { return worker(items[i], i); })
+        .then(function (v) { results[i] = v; }, function () { results[i] = null; })
+        .then(function () {
+          active--; done++;
+          if (onProgress) onProgress(done, items.length);
+          if (done === items.length) resolve(results); else launch();
+        });
+    }
+    function launch() {
+      while (active < limit && next < items.length) { active++; run(next++); }
+    }
+    launch();
+  });
+}
+
+// Reintento con espera creciente. Los errores lógicos de Moodle
+// (accessexception, invalidtoken…) se marcan fatales y no se reintentan.
+function fundaeRetry(fn, tries, delay) {
+  return fn().catch(function (e) {
+    if (tries <= 1 || (e && e.fatal)) throw e;
+    return new Promise(function (r) { setTimeout(r, delay); })
+      .then(function () { return fundaeRetry(fn, tries - 1, delay * 2); });
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Acceso a Moodle                                                     */
+/* ------------------------------------------------------------------ */
+
+// M.cfg.courseId es la vía directa; el resto son respaldos por si un tema
+// o una versión no lo expone.
+function fundaeCourseId() {
+  if (typeof M !== 'undefined' && M.cfg && M.cfg.courseId) {
+    var id = parseInt(M.cfg.courseId, 10);
+    if (id > 1) return id; // 1 = portada del sitio, no es un curso
+  }
+  var m = location.pathname.match(/course\/view\.php/) && location.search.match(/[?&]id=(\d+)/);
+  if (m) return parseInt(m[1], 10);
+  var bc = document.body.className.match(/course-(\d+)/);
+  if (bc) return parseInt(bc[1], 10);
+  return null;
+}
+
+function ws(fn, args) {
+  return fundaeRetry(function () {
+    var body = new URLSearchParams();
+    body.set('wstoken', getToken());
+    body.set('wsfunction', fn);
+    body.set('moodlewsrestformat', 'json');
+    Object.keys(args || {}).forEach(function (k) { body.set(k, args[k]); });
+    return fetch(M.cfg.wwwroot + '/webservice/rest/server.php', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString()
+    }).then(function (r) {
+      if (!r.ok) { var he = new Error('HTTP ' + r.status); he.status = r.status; throw he; }
+      return r.json();
+    }).then(function (j) {
+      if (j && j.exception) {
+        var err = new Error(j.message || j.errorcode);
+        err.errorcode = j.errorcode || '';
+        err.fatal = true; // error lógico: reintentar no cambia nada
+        throw err;
+      }
+      return j;
+    });
+  }, RETRIES, 500);
+}
+
+// Comprueba si quien ve la página puede ver los registros del curso.
+// Sirve para dos cosas: saber si podremos calcular tiempos, y como guarda
+// de rol — el alumnado no tiene report/log:view, así que no debe llegar a
+// ver la pantalla de conexión ni generar tokens.
+function fundaeCanViewLogs(courseid) {
+  return fetch(M.cfg.wwwroot + '/report/log/index.php?id=' + courseid, { credentials: 'same-origin' })
+    .then(function (r) { return r.text(); })
+    .then(function (html) { return html.indexOf('logreader') >= 0 || html.indexOf('chooselog') >= 0; })
+    .catch(function () { return false; });
+}
+
+/* --- Registros: descarga y análisis --------------------------------- */
+
+// Devuelve las partes de fecha sin interpretar (ver fundaeResolveDateOrder):
+// no se puede decidir aún si «03/07» es 3 de julio o 7 de marzo.
+function fundaeLogParts(courseid, userid) {
+  var p = new URLSearchParams({
+    chooselog: 1, id: courseid, user: userid, date: 0,
+    modid: '', modaction: '', origin: '', edulevel: -1,
+    logreader: 'logstore_standard', download: 'json'
+  });
+  return fetch(M.cfg.wwwroot + '/report/log/index.php?' + p.toString(), { credentials: 'same-origin' })
+    .then(function (r) { return r.text(); })
+    .then(function (txt) {
+      var rows;
+      try { rows = JSON.parse(txt); } catch (e) { return null; } // sin permiso → HTML, no JSON
+      if (!Array.isArray(rows)) return null;
+      var out = [];
+      rows.forEach(function (row) {
+        var parts = fundaeParseLogValue(fundaeTimeCell(row));
+        if (parts) out.push(parts);
+      });
+      return out;
+    })
+    .catch(function () { return null; });
+}
+
+// Localiza la columna de hora por el NOMBRE de la cabecera. Depender de la
+// posición rompía en cuanto el informe cambiaba de columnas.
+function fundaeTimeCell(row) {
+  var keys = Object.keys(row || {});
+  for (var i = 0; i < keys.length; i++) {
+    if (/hora|time|fecha|date|zeit|heure/i.test(keys[i])) return row[keys[i]];
+  }
+  return keys.length ? row[keys[0]] : '';
+}
+
+// Analiza un valor de fecha del informe SIN resolver el orden día/mes.
+// Acepta ISO (aaaa-mm-dd) y los formatos numéricos con barra o guion.
+function fundaeParseLogValue(v) {
+  var s = String(v == null ? '' : v);
+  var iso = s.match(/(\d{4})-(\d{1,2})-(\d{1,2})\D+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (iso) {
+    return {
+      iso: true, y: +iso[1], mo: +iso[2], d: +iso[3],
+      h: +iso[4], mi: +iso[5], s: +(iso[6] || 0)
+    };
+  }
+  var m = s.match(/(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})\D+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  var y = +m[3]; if (y < 100) y += 2000;
+  return { iso: false, a: +m[1], b: +m[2], y: y, h: +m[4], mi: +m[5], s: +(m[6] || 0) };
+}
+
+// Decide si el informe viene en d/m/aa o en m/d/aa mirando TODO el conjunto:
+// un valor mayor que 12 en una posición la fija como día. Si ningún valor lo
+// desambigua, se asume d/m (Moodle en español) pero se marca `ambiguous` y el
+// panel avisa de que la estimación no está verificada. Preferimos declarar la
+// duda a publicar horas que parecen buenas y no lo son.
+function fundaeResolveDateOrder(partsList) {
+  var aOver = false, bOver = false, seen = false;
+  (partsList || []).forEach(function (parts) {
+    (parts || []).forEach(function (p) {
+      if (!p || p.iso) return;
+      seen = true;
+      if (p.a > 12) aOver = true;
+      if (p.b > 12) bOver = true;
+    });
+  });
+  if (aOver && !bOver) return { dayFirst: true, ambiguous: false };
+  if (bOver && !aOver) return { dayFirst: false, ambiguous: false };
+  // Ni un solo valor por encima de 12 (o ambos): no hay evidencia suficiente.
+  return { dayFirst: true, ambiguous: seen };
+}
+
+function fundaePartsToTs(parts, dayFirst) {
+  return (parts || []).map(function (p) {
+    var d = p.iso ? p.d : (dayFirst ? p.a : p.b);
+    var mo = p.iso ? p.mo : (dayFirst ? p.b : p.a);
+    return new Date(p.y, mo - 1, d, p.h, p.mi, p.s).getTime() / 1000;
+  });
+}
+
+// Reconstruye sesiones a partir de timestamps con el umbral de inactividad.
+// A cada sesión se le suma SESSION_MIN_SEC: la duración bruta (último evento
+// menos primero) da CERO cuando la sesión tiene un único evento registrado,
+// lo que infravaloraba de forma sistemática las horas acreditadas.
+function fundaeSessions(ts) {
+  if (!ts || !ts.length) return { seconds: 0, sessions: 0, list: [] };
+  ts = ts.slice().sort(function (a, b) { return a - b; });
+  var gap = SESSION_GAP_MIN * 60;
+  var list = [], start = ts[0], prev = ts[0];
+  function push(a, b) { list.push({ start: a, end: b, seconds: (b - a) + SESSION_MIN_SEC }); }
+  for (var i = 1; i < ts.length; i++) {
+    if (ts[i] - prev > gap) { push(start, prev); start = ts[i]; }
+    prev = ts[i];
+  }
+  push(start, prev);
+  var total = list.reduce(function (a, sn) { return a + sn.seconds; }, 0);
+  return { seconds: total, sessions: list.length, list: list };
+}
+
+// Agrupa las sesiones por día natural (clave aaaa-mm-dd, por fecha de inicio).
+function fundaeByDay(list) {
+  var days = {};
+  (list || []).forEach(function (sn) {
+    var d = new Date(sn.start * 1000);
+    var key = d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2);
+    if (!days[key]) days[key] = { day: key, seconds: 0, sessions: 0 };
+    days[key].seconds += sn.seconds;
+    days[key].sessions++;
+  });
+  return Object.keys(days).sort().map(function (k) { return days[k]; });
+}
+
+/* ------------------------------------------------------------------ */
+/* Carga de datos                                                      */
+/* ------------------------------------------------------------------ */
+
+function fundaeIsStudent(u) {
+  return (u.roles || []).some(function (r) {
+    var sn = String(r.shortname || '').toLowerCase();
+    return STUDENT_ROLES.indexOf(sn) >= 0 || sn.indexOf('student') === 0 || sn.indexOf('alumn') === 0;
+  });
+}
+
+function fundaeLoading(txt, sub) {
+  document.getElementById('fp-body').innerHTML =
+    '<div class="card fp-card"><div class="card-body" style="text-align:center;padding:48px 20px;">' +
+    '<div class="spinner-border text-primary" role="status" style="margin-bottom:10px;"></div>' +
+    '<div class="fp-muted" id="fp-loading-txt">' + esc(txt) + '</div>' +
+    '<div class="fp-muted" id="fp-loading-sub" style="font-size:.8em;">' + esc(sub || '') + '</div>' +
+    '</div></div>';
+}
 
 function fundaeRun() {
   var out = document.getElementById('fp-body');
   var courseid = fundaeCourseId();
   if (!courseid) { out.innerHTML = '<div class="fp-error">No se ha podido detectar el id del curso.</div>'; return; }
-  if (!getToken()) { fundaeConnect(); return; }
-  out.innerHTML = '<div class="card fp-card"><div class="card-body" style="text-align:center;padding:48px 20px;">' +
-    '<div class="spinner-border text-primary" role="status" style="margin-bottom:10px;"></div>' +
-    '<div class="fp-muted">Consultando API y registros del curso…</div></div></div>';
+  if (!getToken()) { fundaeConnectScreen(); return; }
 
-  var course, contents, grades, rawStudents;
+  fundaeLoading('Consultando API y registros del curso…');
 
-  ws('core_course_get_courses_by_field', { field: 'id', value: String(courseid) })
+  var course, contents, grades, rawStudents, canLogs = false;
+
+  fundaeCanViewLogs(courseid)
+    .then(function (ok) {
+      canLogs = ok;
+      return ws('core_course_get_courses_by_field', { field: 'id', value: String(courseid) });
+    })
     .then(function (r) {
       course = r.courses && r.courses[0];
       if (!course) throw new Error('Curso no encontrado o sin permisos.');
@@ -274,44 +361,57 @@ function fundaeRun() {
     })
     .then(function (rs) {
       contents = rs[1]; grades = rs[2];
-      rawStudents = rs[0].filter(function (u) {
-        return (u.roles || []).some(function (r) { return r.shortname === 'student'; });
-      });
+      rawStudents = rs[0].filter(fundaeIsStudent);
       var sample = rawStudents.slice(0, MAX_ALUMNOS);
-      return Promise.all(sample.map(function (u) {
+
+      // Pool con concurrencia limitada + progreso visible: cada alumno son
+      // 2 llamadas a la API y una descarga de registros.
+      return fundaePool(sample, function (u) {
         var pCourse = ws('core_completion_get_course_completion_status', { courseid: courseid, userid: u.id })
           .then(function (r) { return r.completionstatus; }).catch(function () { return null; });
         var pActs = ws('core_completion_get_activities_completion_status', { courseid: courseid, userid: u.id })
           .then(function (r) { return r.statuses || []; }).catch(function () { return null; });
-        var pLogs = fundaeLogTimestamps(courseid, u.id);
+        var pLogs = canLogs ? fundaeLogParts(courseid, u.id) : Promise.resolve(null);
         return Promise.all([pCourse, pActs, pLogs]).then(function (pr) {
-          return { user: u, completion: pr[0], actstatuses: pr[1], logts: pr[2] };
+          return { user: u, completion: pr[0], actstatuses: pr[1], logparts: pr[2] };
         });
-      }));
+      }, CONCURRENCY, function (done, total) {
+        var el = document.getElementById('fp-loading-sub');
+        if (el) el.textContent = done + ' / ' + total + ' alumnos';
+      });
     })
-    .then(function (perStudent) { fundaeBuild(course, rawStudents, perStudent, contents, grades); })
+    .then(function (perStudent) {
+      fundaeBuild(course, rawStudents, perStudent.filter(Boolean), contents, grades, canLogs);
+    })
     .catch(function (e) {
       if (e.errorcode === 'invalidtoken') {
         // Token caducado o revocado: se borra del navegador y se pide de nuevo.
         setToken('');
-        fundaeTokenSetup('El token guardado no es válido o ha caducado. Genera uno nuevo en Claves de seguridad y pégalo aquí.');
+        fundaeConnectScreen('El token guardado ya no es válido (caducado o revocado). Vuelve a conectar.');
         return;
       }
       var hint = '';
       if (e.errorcode === 'servicenotavailable') hint = 'Servicios web o protocolo REST deshabilitados (README, paso 1).';
       else if (e.errorcode === 'accessexception') hint = 'Función no añadida al servicio, o tu usuario no tiene permiso para usar REST o no está autorizado en el servicio (README, pasos 2 y 3).';
       out.innerHTML = '<div class="fp-error">Error consultando la API: ' + esc(e.message) +
-        (hint ? '<br><small>' + hint + '</small>' : '') + '</div>';
+        (hint ? '<br><small>' + esc(hint) + '</small>' : '') + '</div>';
     });
 }
 
-function fundaeBuild(course, rawStudents, perStudent, contents, grades) {
+function fundaeBuild(course, rawStudents, perStudent, contents, grades, canLogs) {
   var now = Math.floor(Date.now() / 1000);
 
+  // El orden día/mes se decide con TODOS los registros del curso a la vez.
+  var order = fundaeResolveDateOrder(perStudent.map(function (ps) { return ps.logparts; }));
+  fundaeData.dateOrder = order;
+
+  // Notas: `graderaw` para decidir si hay evaluación (numérico y estable) y
+  // `gradeformatted` solo para mostrar. Comparar el texto contra «-» dependía
+  // del idioma del sitio.
   var finalGrades = {};
   ((grades && grades.usergrades) || []).forEach(function (ug) {
     var gi = (ug.gradeitems || []).filter(function (g) { return g.itemtype === 'course'; })[0];
-    finalGrades[ug.userid] = gi ? gi.gradeformatted : null;
+    finalGrades[ug.userid] = gi ? { raw: gi.graderaw, txt: gi.gradeformatted } : null;
   });
 
   var students = perStudent.map(function (ps) {
@@ -322,7 +422,8 @@ function fundaeBuild(course, rawStudents, perStudent, contents, grades) {
       var done = ps.actstatuses.filter(function (s) { return s.state === 1 || s.state === 2; }).length;
       pct = Math.round(done * 100 / ps.actstatuses.length);
     }
-    var ses = ps.logts === null ? null : fundaeSessions(ps.logts);
+    var ses = ps.logparts === null ? null : fundaeSessions(fundaePartsToTs(ps.logparts, order.dayFirst));
+    var g = finalGrades[u.id];
     return {
       uid: u.id,
       name: u.fullname,
@@ -334,7 +435,8 @@ function fundaeBuild(course, rawStudents, perStudent, contents, grades) {
       sessions: ses === null ? null : ses.sessions,
       byDay: ses === null ? null : fundaeByDay(ses.list),
       completed: ps.completion ? !!ps.completion.completed : null,
-      grade: finalGrades[u.id] || null
+      grade: g && g.txt ? g.txt : null,
+      graded: !!(g && g.raw !== null && g.raw !== undefined && g.raw !== '')
     };
   });
 
@@ -344,10 +446,15 @@ function fundaeBuild(course, rawStudents, perStudent, contents, grades) {
   var hasForum = mods.some(function (m) { return ['forum', 'chat', 'bigbluebuttonbn'].indexOf(m.modname) >= 0; });
 
   // --- Desglose por tipo de actividad/recurso y estado de calificación ---
-  var ug0 = ((grades && grades.usergrades) || [])[0];
+  // El mapa de ítems se construye con la UNIÓN de todos los alumnos: tomarlo
+  // del primero daba un inventario falso si a ese alumno le ocultaban ítems.
   var giByMod = {};
-  ((ug0 && ug0.gradeitems) || []).forEach(function (gi) {
-    if (gi.itemtype === 'mod') giByMod[gi.itemmodule + ':' + gi.iteminstance] = gi;
+  ((grades && grades.usergrades) || []).forEach(function (ug) {
+    (ug.gradeitems || []).forEach(function (gi) {
+      if (gi.itemtype !== 'mod') return;
+      var key = gi.itemmodule + ':' + gi.iteminstance;
+      if (!giByMod[key] || (gi.grademax > 0 && !(giByMod[key].grademax > 0))) giByMod[key] = gi;
+    });
   });
   var RESOURCES = ['resource', 'url', 'page', 'book', 'folder', 'label', 'imscp'];
   var GRADABLE = ['assign', 'quiz', 'scorm', 'forum', 'glossary', 'data', 'lesson', 'workshop', 'lti', 'h5pactivity', 'hvp'];
@@ -380,7 +487,7 @@ function fundaeBuild(course, rawStudents, perStudent, contents, grades) {
   var nDone = students.filter(function (s) { return s.completed === true; }).length;
   var completionEnabled = students.some(function (s) { return s.completed !== null; });
   var pctDone = students.length ? Math.round(nDone * 100 / students.length) : 0;
-  var anyGraded = students.some(function (s) { return s.grade && s.grade !== '-'; });
+  var anyGraded = students.some(function (s) { return s.graded; });
   var pctTracking = students.some(function (s) { return s.pct !== null; });
   var nOver75 = students.filter(function (s) { return s.pct !== null && s.pct >= 75; }).length;
   var timeTracking = students.some(function (s) { return s.time !== null; });
@@ -389,6 +496,8 @@ function fundaeBuild(course, rawStudents, perStudent, contents, grades) {
   fundaeData.course = course;
   fundaeData.students = students;
   fundaeData.modtypes = modtypes;
+  fundaeData.canLogs = canLogs;
+  fundaeData.totalStudents = rawStudents.length;
   fundaeData.truncated = rawStudents.length > students.length;
   fundaeData.summary = {
     nStudents: students.length, pctAccess: pctAccess, pctDone: pctDone, nEval: nEval,
@@ -398,13 +507,17 @@ function fundaeBuild(course, rawStudents, perStudent, contents, grades) {
     nScorm: scorm.items.length, scormGraded: scorm.nGraded,
     nGradableActs: nGradableActs, nGradedActs: nGradedActs
   };
-  fundaeRender();
+  fundaeRenderShell();
 }
 
+/* ------------------------------------------------------------------ */
+/* Presentación                                                        */
+/* ------------------------------------------------------------------ */
+
 function badge(status, txtOk, txtWarn, txtFail) {
-  if (status === true)  return '<span class="badge fp-ok">' + (txtOk || 'Cumple') + '</span>';
-  if (status === 'warn') return '<span class="badge fp-warn">' + (txtWarn || 'Atención') + '</span>';
-  return '<span class="badge fp-fail">' + (txtFail || 'No cumple') + '</span>';
+  if (status === true)  return '<span class="badge fp-ok">' + esc(txtOk || 'Cumple') + '</span>';
+  if (status === 'warn') return '<span class="badge fp-warn">' + esc(txtWarn || 'Atención') + '</span>';
+  return '<span class="badge fp-fail">' + esc(txtFail || 'No cumple') + '</span>';
 }
 
 function progressBar(pct) {
@@ -414,20 +527,22 @@ function progressBar(pct) {
     '<div class="progress-bar ' + cls + '" style="width:' + pct + '%; min-width:2.4em;">' + pct + '%</div></div>';
 }
 
-function fundaeRender() {
-  var c = fundaeData.course, s = fundaeData.summary, students = fundaeData.students;
+// El esqueleto se pinta UNA vez tras cargar los datos. Los filtros viven aquí
+// y no se destruyen al escribir: antes cada tecla rehacía todo el DOM y había
+// que devolver el foco a mano.
+function fundaeRenderShell() {
+  var c = fundaeData.course, s = fundaeData.summary;
 
-  // --- Chips de la cabecera ---
   document.getElementById('fp-chips').innerHTML =
-    '<span class="fp-chip">🎓 ' + esc(c.fullname) + '</span>' +
-    (c.startdate ? '<span class="fp-chip">📅 ' + fmtDay(c.startdate) + ' — ' + (c.enddate ? fmtDay(c.enddate) : 'sin fin') + '</span>' : '') +
-    '<span class="fp-chip">👥 ' + s.nStudents + ' alumnos</span>';
+    '<span class="fp-chip">' + ic('🎓') + ' ' + esc(c.fullname) + '</span>' +
+    (c.startdate ? '<span class="fp-chip">' + ic('📅') + ' ' + esc(fmtDay(c.startdate)) + ' — ' +
+      esc(c.enddate ? fmtDay(c.enddate) : 'sin fin') + '</span>' : '') +
+    '<span class="fp-chip">' + ic('👥') + ' ' + s.nStudents + ' alumnos</span>';
 
-  // --- KPIs ---
   function kpi(icon, num, lbl) {
     return '<div class="card fp-card fp-kpi">' +
-      '<div class="fp-ic">' + icon + '</div>' +
-      '<div class="fp-num">' + num + '</div><div class="fp-lbl">' + lbl + '</div></div>';
+      '<div class="fp-ic">' + ic(icon) + '</div>' +
+      '<div class="fp-num">' + esc(num) + '</div><div class="fp-lbl">' + esc(lbl) + '</div></div>';
   }
   var kpis = '<div class="fp-kpis">' +
     kpi('👥', s.nStudents, 'Alumnos') +
@@ -436,15 +551,88 @@ function fundaeRender() {
     kpi('⏱', s.timeTracking ? fmtDur(s.totalTime) : 'n/d', 'Tiempo total del grupo') +
     '</div>';
 
-  // --- Checklist ---
+  var w = M.cfg.wwwroot, cid = c.id;
+  function rlink(icon, title, desc, url) {
+    return '<a class="fp-link" href="' + esc(url) + '" target="_blank" rel="noopener">' +
+      '<span class="fp-l-ic">' + ic(icon) + '</span><span><b>' + esc(title) + '</b><small>' + esc(desc) + '</small></span></a>';
+  }
+  var links = '<div class="fp-links">' +
+    rlink('🧾', 'Registros (logs)', 'Eventos exportables', w + '/report/log/index.php?id=' + cid) +
+    rlink('👥', 'Participación', 'Actividad por módulo', w + '/report/participation/index.php?id=' + cid) +
+    rlink('✅', 'Finalización de actividades', 'Progreso por actividad', w + '/report/progress/index.php?course=' + cid) +
+    rlink('🎓', 'Finalización del curso', 'Estado por alumno', w + '/report/completion/index.php?course=' + cid) +
+    rlink('📊', 'Calificaciones', 'Libro de calificaciones', w + '/grade/report/grader/index.php?id=' + cid) +
+    rlink('📋', 'Informe de actividad', 'Vistas por recurso', w + '/report/outline/index.php?id=' + cid) +
+    '</div>';
+
+  function hIc(icon) { return '<span class="fp-h-ic">' + ic(icon) + '</span>'; }
+
+  var ambiguous = fundaeData.dateOrder && fundaeData.dateOrder.ambiguous;
+  var timeNote = !fundaeData.canLogs
+    ? 'Sin acceso a los registros: hace falta el permiso <code>report/log:view</code> en el curso.'
+    : (ambiguous
+      ? '⚠ El formato de fecha de los registros es ambiguo en este sitio (ningún valor supera 12, así que no se puede distinguir día de mes). Los tiempos se han calculado asumiendo d/m/aa y <strong>no están verificados</strong>: contrástalos con el informe Registros antes de usarlos como evidencia.'
+      : 'Estimación desde los registros de eventos, con corte de sesión a ' + SESSION_GAP_MIN +
+        ' min de inactividad y un mínimo de ' + SESSION_MIN_SEC + ' s por sesión. Pulsa el tiempo de un alumno para ver su desglose por días.');
+
+  document.getElementById('fp-body').innerHTML =
+    kpis +
+    '<div class="card fp-card"><div class="card-body">' +
+    '<h5>' + hIc('🗂') + 'Checklist de evidencias <span style="margin-left:auto;" id="fp-check-summary"></span></h5>' +
+    '<div class="table-responsive"><table><caption class="fp-sr">Evidencias FUNDAE comprobadas automáticamente</caption><thead><tr>' +
+    '<th scope="col" style="text-align:center;">#</th><th scope="col">Comprobación</th>' +
+    '<th scope="col" style="text-align:center;">Estado</th><th scope="col">Detalle</th>' +
+    '</tr></thead><tbody id="fp-check-tbody"></tbody></table></div></div></div>' +
+
+    '<div class="card fp-card"><div class="card-body">' +
+    '<h5>' + hIc('🧩') + 'Actividades y recursos del curso' +
+    '<label class="fp-sr" for="fp-modfilter">Filtrar actividad o tipo</label>' +
+    '<input id="fp-modfilter" class="fp-filter fp-noprint" placeholder="🔍 Filtrar actividad o tipo…"></h5>' +
+    '<div class="table-responsive"><table><caption class="fp-sr">Inventario de actividades y recursos por tipo</caption><thead><tr>' +
+    '<th scope="col">Tipo</th><th scope="col" style="text-align:center;">Nº</th>' +
+    '<th scope="col" style="text-align:center;">Naturaleza</th>' +
+    '<th scope="col" style="text-align:center;">Calificable</th>' +
+    '<th scope="col" style="text-align:center;">Calif. configurada</th>' +
+    '</tr></thead><tbody id="fp-mod-tbody"></tbody></table></div></div></div>' +
+
+    '<div class="card fp-card"><div class="card-body">' +
+    '<h5>' + hIc('👤') + 'Seguimiento por alumno' +
+    '<label class="fp-sr" for="fp-filter">Filtrar alumno</label>' +
+    '<input id="fp-filter" class="fp-filter fp-noprint" placeholder="🔍 Filtrar alumno…"></h5>' +
+    '<div class="table-responsive fp-scroll"><table class="table-hover">' +
+    '<caption class="fp-sr">Seguimiento individual del alumnado</caption>' +
+    '<thead id="fp-stu-thead"></thead><tbody id="fp-stu-tbody"></tbody></table></div>' +
+    (fundaeData.truncated ? '<p class="fp-muted" style="margin:8px 0 0;">Mostrando los primeros ' +
+      fundaeData.students.length + ' de ' + fundaeData.totalStudents + ' alumnos (límite PoC, MAX_ALUMNOS).</p>' : '') +
+    '<p class="fp-muted" style="margin:8px 0 0;">' + ic('⏱') + ' Tiempo en curso: ' + timeNote + '</p>' +
+    '<p class="fp-muted" style="margin:6px 0 0;">' + ic('🔒') + ' Esta tabla y los CSV contienen datos personales ' +
+    '(nombre, correo y patrón horario de conexión). Trátalos según la política de protección de datos de tu entidad.</p>' +
+    '</div></div>' +
+
+    '<div class="card fp-card"><div class="card-body">' +
+    '<h5>' + hIc('🔗') + 'Informes oficiales de Moodle <span class="fp-muted" style="font-weight:400;">evidencia documental exportable</span></h5>' +
+    links + '</div></div>';
+
+  fundaeRenderChecklist();
+  fundaeRenderTables();
+  document.getElementById('fp-timestamp').textContent = 'Actualizado: ' + new Date().toLocaleString();
+}
+
+function fundaeRenderChecklist() {
+  var c = fundaeData.course, s = fundaeData.summary;
   var hasDates = !!(c.startdate && c.enddate);
+  var ambiguous = fundaeData.dateOrder && fundaeData.dateOrder.ambiguous;
   var checks = [
     ['Curso con fechas de inicio y fin', hasDates, 'Inicio: ' + fmtDate(c.startdate) + ' · Fin: ' + fmtDate(c.enddate)],
     ['Alumnos matriculados', s.nStudents > 0, s.nStudents + ' alumnos'],
     ['Trazabilidad: alumnos con acceso al curso', s.pctAccess === 100 ? true : (s.pctAccess >= 75 ? 'warn' : false), s.pctAccess + '% (' + s.nAcc + '/' + s.nStudents + ')'],
-    ['Tiempos de conexión calculados desde los registros', s.timeTracking ? true : 'warn',
-      s.timeTracking ? 'Total del grupo: ' + fmtDur(s.totalTime) + ' (sesiones con corte a ' + SESSION_GAP_MIN + ' min de inactividad)'
-                     : 'Sin acceso a los registros: el usuario que ve la página necesita el permiso report/log:view en el curso'],
+    ['Tiempos de conexión calculados desde los registros',
+      s.timeTracking ? (ambiguous ? 'warn' : true) : 'warn',
+      s.timeTracking
+        ? (ambiguous
+          ? 'Total del grupo: ' + fmtDur(s.totalTime) + ' — formato de fecha ambiguo, estimación SIN verificar'
+          : 'Total del grupo: ' + fmtDur(s.totalTime) + ' (sesiones con corte a ' + SESSION_GAP_MIN + ' min de inactividad)')
+        : 'Sin acceso a los registros: el usuario que ve la página necesita el permiso report/log:view en el curso'],
     ['Seguimiento de finalización activado', s.completionEnabled, s.completionEnabled ? 'Completion habilitado' : 'Sin datos de finalización (¿completion desactivado?)'],
     ['Controles de aprendizaje (cuestionario/tarea)', s.nEval > 0, s.nEval + ' actividades evaluables'],
     ['Contenido SCORM cargado', s.nScorm > 0 ? true : 'warn',
@@ -461,14 +649,20 @@ function fundaeRender() {
     ['Alumnos con curso completado', s.pctDone === 100 ? true : (s.pctDone > 0 ? 'warn' : false), s.pctDone + '% (' + s.nDone + '/' + s.nStudents + ')']
   ];
   var nOk = checks.filter(function (ch) { return ch[1] === true; }).length;
-  var checkRows = checks.map(function (ch, i) {
+  document.getElementById('fp-check-tbody').innerHTML = checks.map(function (ch, i) {
     return '<tr><td style="text-align:center;" class="fp-muted">' + (i + 1) + '</td><td>' + esc(ch[0]) + '</td>' +
       '<td style="text-align:center;">' + badge(ch[1]) + '</td><td class="fp-muted">' + esc(ch[2]) + '</td></tr>';
   }).join('');
-  var checkSummary = badge(nOk === checks.length ? true : (nOk >= checks.length / 2 ? 'warn' : false),
-    nOk + ' de ' + checks.length, nOk + ' de ' + checks.length, nOk + ' de ' + checks.length);
+  var txt = nOk + ' de ' + checks.length;
+  document.getElementById('fp-check-summary').innerHTML =
+    badge(nOk === checks.length ? true : (nOk >= checks.length / 2 ? 'warn' : false), txt, txt, txt);
+}
 
-  // --- Desglose de actividades y recursos por tipo (con filtro) ---
+// Solo repinta los <tbody>: filtrar y ordenar ya no destruye los inputs.
+function fundaeRenderTables() {
+  var students = fundaeData.students;
+
+  // --- Actividades y recursos ---
   var mfilter = (document.getElementById('fp-modfilter') || {}).value || '';
   var mfl = mfilter.toLowerCase();
   var modRows = (fundaeData.modtypes || []).map(function (g) {
@@ -489,8 +683,9 @@ function fundaeRender() {
       : badge(nShownGraded === shown.length ? true : (nShownGraded > 0 ? 'warn' : false), confTxt, confTxt, confTxt);
     var nTxt = shown.length + (shown.length !== g.items.length ? ' <span class="fp-muted">de ' + g.items.length + '</span>' : '');
     var html = '<tr>' +
-      '<td><a href="javascript:void(0)" class="fp-tg" onclick="fundaeToggleType(\'' + g.type + '\')" title="Ver elementos">' +
-      car(open) + esc(g.label) + '</a> <span class="fp-muted">(' + g.type + ')</span></td>' +
+      '<td><button type="button" class="fp-tg" data-fp-action="toggle-type" data-fp-type="' + esc(g.type) + '" ' +
+      'aria-expanded="' + (open ? 'true' : 'false') + '">' +
+      car(open) + esc(g.label) + '</button> <span class="fp-muted">(' + esc(g.type) + ')</span></td>' +
       '<td style="text-align:center;">' + nTxt + '</td>' +
       '<td style="text-align:center;">' + nat + '</td>' +
       '<td style="text-align:center;">' + calif + '</td>' +
@@ -506,8 +701,26 @@ function fundaeRender() {
     }
     return html;
   }).join('');
+  document.getElementById('fp-mod-tbody').innerHTML = modRows ||
+    '<tr><td colspan="5" class="fp-muted">' +
+    (mfilter ? 'Ningún elemento coincide con el filtro' : 'El curso no tiene actividades ni recursos') + '</td></tr>';
 
-  // --- Tabla alumnos (con orden actual) ---
+  // --- Cabecera ordenable ---
+  function th(key, label, title) {
+    var active = fundaeData.sortKey === key;
+    var arrow = active ? (fundaeData.sortDir === 1 ? ' ▲' : ' ▼') : '';
+    return '<th scope="col" class="fp-sortable" data-fp-action="sort" data-fp-key="' + esc(key) + '"' +
+      ' aria-sort="' + (active ? (fundaeData.sortDir === 1 ? 'ascending' : 'descending') : 'none') + '"' +
+      (title ? ' title="' + esc(title) + '"' : '') + ' tabindex="0" role="columnheader">' +
+      esc(label) + arrow + '</th>';
+  }
+  document.getElementById('fp-stu-thead').innerHTML = '<tr>' +
+    th('name', 'Alumno') + th('last', 'Último acceso') + th('days', 'Inactividad') +
+    th('time', 'Tiempo en curso', 'Suma de sesiones reconstruidas desde los registros; una sesión se cierra tras ' +
+      SESSION_GAP_MIN + ' min sin eventos') +
+    th('pct', 'Progreso') + th('completed', 'Finalización') + th('grade', 'Nota') + '</tr>';
+
+  // --- Filas de alumnado ---
   var k = fundaeData.sortKey, dir = fundaeData.sortDir;
   var sorted = students.slice().sort(function (a, b) {
     var va = a[k], vb = b[k];
@@ -528,8 +741,9 @@ function fundaeRender() {
       : (st.completed ? badge(true, 'Completado') : '<span class="badge fp-neutral">En curso</span>');
     var open = !!fundaeData.expanded[st.uid];
     var timeTxt = st.time === null ? '<span class="fp-muted">n/d</span>'
-      : '<a href="javascript:void(0)" class="fp-tg" onclick="fundaeToggle(' + st.uid + ')" title="Ver desglose por días">' +
-        car(open) + esc(fmtDur(st.time)) + '</a> <span class="fp-muted">(' + st.sessions + ' ses.)</span>';
+      : '<button type="button" class="fp-tg" data-fp-action="toggle-student" data-fp-uid="' + st.uid + '" ' +
+        'aria-expanded="' + (open ? 'true' : 'false') + '" title="Ver desglose por días">' +
+        car(open) + esc(fmtDur(st.time)) + '</button> <span class="fp-muted">(' + st.sessions + ' ses.)</span>';
     var html = '<tr>' +
       '<td><span class="fp-stu">' + avatar(st.name) + '<span>' + esc(st.name) +
       '<br><span class="fp-muted">' + esc(st.email) + '</span></span></span></td>' +
@@ -540,119 +754,57 @@ function fundaeRender() {
     if (open && st.byDay && st.byDay.length) {
       var dayRows = st.byDay.map(function (d) {
         var parts = d.day.split('-');
-        return '<tr><td>' + parts[2] + '/' + parts[1] + '/' + parts[0] + '</td>' +
+        return '<tr><td>' + esc(parts[2] + '/' + parts[1] + '/' + parts[0]) + '</td>' +
           '<td style="text-align:center;">' + d.sessions + '</td><td>' + esc(fmtDur(d.seconds)) + '</td></tr>';
       }).join('');
       html += '<tr class="fp-detail"><td></td><td colspan="6">' +
         '<table style="max-width:420px;">' +
-        '<thead><tr><th>Día</th><th style="text-align:center;">Sesiones</th><th>Tiempo</th></tr></thead>' +
+        '<thead><tr><th scope="col">Día</th><th scope="col" style="text-align:center;">Sesiones</th>' +
+        '<th scope="col">Tiempo</th></tr></thead>' +
         '<tbody>' + dayRows + '</tbody></table></td></tr>';
     } else if (open) {
       html += '<tr class="fp-detail"><td></td><td colspan="6" class="fp-muted">Sin sesiones registradas.</td></tr>';
     }
     return html;
   }).join('');
-
-  function th(key, label, title) {
-    var arrow = fundaeData.sortKey === key ? (fundaeData.sortDir === 1 ? ' ▲' : ' ▼') : '';
-    return '<th class="fp-sortable"' + (title ? ' title="' + esc(title) + '"' : '') +
-      ' onclick="fundaeSort(\'' + key + '\')">' + label + arrow + '</th>';
-  }
-
-  // --- Enlaces a informes nativos ---
-  var w = M.cfg.wwwroot, cid = c.id;
-  function rlink(icon, title, desc, url) {
-    return '<a class="fp-link" href="' + url + '" target="_blank">' +
-      '<span class="fp-l-ic">' + icon + '</span><span><b>' + title + '</b><small>' + desc + '</small></span></a>';
-  }
-  var links = '<div class="fp-links">' +
-    rlink('🧾', 'Registros (logs)', 'Eventos exportables', w + '/report/log/index.php?id=' + cid) +
-    rlink('👥', 'Participación', 'Actividad por módulo', w + '/report/participation/index.php?id=' + cid) +
-    rlink('✅', 'Finalización de actividades', 'Progreso por actividad', w + '/report/progress/index.php?course=' + cid) +
-    rlink('🎓', 'Finalización del curso', 'Estado por alumno', w + '/report/completion/index.php?course=' + cid) +
-    rlink('📊', 'Calificaciones', 'Libro de calificaciones', w + '/grade/report/grader/index.php?id=' + cid) +
-    rlink('📋', 'Informe de actividad', 'Vistas por recurso', w + '/report/outline/index.php?id=' + cid) +
-    '</div>';
-
-  function hIc(icon) { return '<span class="fp-h-ic">' + icon + '</span>'; }
-
-  document.getElementById('fp-body').innerHTML =
-    kpis +
-    '<div class="card fp-card"><div class="card-body">' +
-    '<h5>' + hIc('🗂') + 'Checklist de evidencias <span style="margin-left:auto;">' + checkSummary + '</span></h5>' +
-    '<div class="table-responsive"><table><thead><tr>' +
-    '<th style="text-align:center;">#</th><th>Comprobación</th><th style="text-align:center;">Estado</th><th>Detalle</th>' +
-    '</tr></thead><tbody>' + checkRows + '</tbody></table></div></div></div>' +
-    '<div class="card fp-card"><div class="card-body">' +
-    '<h5>' + hIc('🧩') + 'Actividades y recursos del curso' +
-    '<input id="fp-modfilter" class="fp-filter fp-noprint" placeholder="🔍 Filtrar actividad o tipo…" value="' + esc(mfilter) + '" ' +
-    'oninput="fundaeData.lastFilter=\'mod\';fundaeRender()"></h5>' +
-    '<div class="table-responsive"><table><thead><tr>' +
-    '<th>Tipo</th><th style="text-align:center;">Nº</th><th style="text-align:center;">Naturaleza</th>' +
-    '<th style="text-align:center;">Calificable</th><th style="text-align:center;">Calif. configurada</th>' +
-    '</tr></thead><tbody>' +
-    (modRows || '<tr><td colspan="5" class="fp-muted">' +
-      (mfilter ? 'Ningún elemento coincide con el filtro' : 'El curso no tiene actividades ni recursos') + '</td></tr>') +
-    '</tbody></table></div></div></div>' +
-    '<div class="card fp-card"><div class="card-body">' +
-    '<h5>' + hIc('👤') + 'Seguimiento por alumno' +
-    '<input id="fp-filter" class="fp-filter fp-noprint" placeholder="🔍 Filtrar alumno…" value="' + esc(filter) + '" ' +
-    'oninput="fundaeData.lastFilter=\'stu\';fundaeRender()"></h5>' +
-    '<div class="table-responsive fp-scroll"><table class="table-hover"><thead><tr>' +
-    th('name', 'Alumno') + th('last', 'Último acceso') +
-    th('days', 'Inactividad') +
-    th('time', 'Tiempo en curso', 'Suma de sesiones reconstruidas desde los registros; una sesión se cierra tras ' + SESSION_GAP_MIN + ' min sin eventos') +
-    th('pct', 'Progreso') + th('completed', 'Finalización') + th('grade', 'Nota') +
-    '</tr></thead><tbody>' +
-    (rows || '<tr><td colspan="7" class="fp-muted">Sin alumnos' + (filter ? ' que coincidan con el filtro' : ' matriculados') + '</td></tr>') +
-    '</tbody></table></div>' +
-    (fundaeData.truncated ? '<p class="fp-muted" style="margin:8px 0 0;">Mostrando los primeros ' + students.length + ' alumnos (límite PoC).</p>' : '') +
-    '<p class="fp-muted" style="margin:8px 0 0;">⏱ Tiempo en curso: estimación desde los registros de eventos, con corte de sesión a ' +
-    SESSION_GAP_MIN + ' min de inactividad. Pulsa el tiempo de un alumno para ver su desglose por días.</p>' +
-    '</div></div>' +
-    '<div class="card fp-card"><div class="card-body">' +
-    '<h5>' + hIc('🔗') + 'Informes oficiales de Moodle <span class="fp-muted" style="font-weight:400;">evidencia documental exportable</span></h5>' +
-    links + '</div></div>';
-
-  // Mantener el foco en el filtro que se está usando mientras se escribe.
-  var f = fundaeData.lastFilter === 'mod' ? document.getElementById('fp-modfilter')
-                                          : document.getElementById('fp-filter');
-  if (f && f.value) { f.focus(); f.setSelectionRange(f.value.length, f.value.length); }
-
-  document.getElementById('fp-timestamp').textContent = 'Actualizado: ' + new Date().toLocaleString();
+  document.getElementById('fp-stu-tbody').innerHTML = rows ||
+    '<tr><td colspan="7" class="fp-muted">Sin alumnos' +
+    (filter ? ' que coincidan con el filtro' : ' matriculados') + '</td></tr>';
 }
 
-/* --- Auto-conexión: el panel obtiene el token del tutor por su sesión --- */
+/* ------------------------------------------------------------------ */
+/* Conexión: token personal del tutor                                  */
+/* ------------------------------------------------------------------ */
 
 // Moodle auto-crea un token por cada servicio autorizado al visitar la página
 // de claves de seguridad (user/managetoken.php). El valor solo se muestra una
 // vez, justo tras (re)generarlo. Replicamos ese gesto del propio tutor con su
-// sesión (same-origin): leemos el id del token del servicio FUNDAE y forzamos
-// su regeneración con el sesskey, lo que devuelve el valor en el HTML.
-// Es exactamente lo que el tutor haría a mano; no escala privilegios.
+// sesión (same-origin): localizamos el token del servicio SERVICE_NAME y
+// forzamos su regeneración con el sesskey, lo que devuelve el valor en el HTML.
+//
+// IMPORTANTE: solo se toca la fila cuyo servicio coincide con SERVICE_NAME.
+// El respaldo «si solo hay un token, usa ese» se ha eliminado: regeneraba el
+// token de OTRO servicio (típicamente el de la app móvil del propio tutor) y
+// se lo apropiaba, dejándole la app rota sin avisar.
 function fundaeProvisionToken() {
   var base = M.cfg.wwwroot + '/user/managetoken.php';
   return fetch(base, { credentials: 'same-origin' })
     .then(function (r) { return r.text(); })
     .then(function (html) {
       var doc = new DOMParser().parseFromString(html, 'text/html');
-      // Cada token WS tiene un enlace «Reiniciar» con su tokenid. Buscamos la
-      // fila del servicio FUNDAE; si solo hay un token, usamos ese.
-      var links = Array.prototype.slice.call(doc.querySelectorAll('a[href*="resetwstoken"]'));
-      var link = null;
-      for (var i = 0; i < links.length; i++) {
-        var row = links[i].closest('tr');
-        if (row && row.textContent.indexOf(SERVICE_NAME) >= 0) { link = links[i]; break; }
-      }
-      if (!link && links.length === 1) link = links[0];
+      var link = fundaeFindServiceLink(doc, SERVICE_NAME);
       if (!link) throw new Error('no-service');
       var m = (link.getAttribute('href') || '').match(/tokenid=([^&]+)/);
       if (!m) throw new Error('no-tokenid');
+      // Otra pestaña puede haber conectado mientras tanto: no regeneramos dos veces.
+      var already = getToken();
+      if (already) return null;
       var url = base + '?action=resetwstoken&tokenid=' + encodeURIComponent(m[1]) +
         '&confirm=1&sesskey=' + encodeURIComponent(M.cfg.sesskey);
       return fetch(url, { credentials: 'same-origin' }).then(function (r) { return r.text(); });
     })
     .then(function (html2) {
+      if (html2 === null) return getToken();
       var tok = fundaeExtractToken(html2);
       if (tok) return tok;
       // Algunos temas renderizan el valor en una segunda carga (variable de sesión).
@@ -666,6 +818,26 @@ function fundaeProvisionToken() {
     });
 }
 
+// Busca el enlace «Reiniciar» de la fila cuyo servicio es exactamente
+// `service`. Primero exige coincidencia exacta de celda; si el tema añade
+// texto alrededor, acepta que la fila lo contenga. Nunca devuelve una fila
+// que no mencione el servicio.
+function fundaeFindServiceLink(doc, service) {
+  var links = Array.prototype.slice.call(doc.querySelectorAll('a[href*="resetwstoken"]'));
+  var target = String(service).trim().toLowerCase();
+  var loose = null;
+  for (var i = 0; i < links.length; i++) {
+    var row = links[i].closest ? links[i].closest('tr') : null;
+    if (!row) continue;
+    var cells = Array.prototype.slice.call(row.querySelectorAll('td, th'));
+    for (var j = 0; j < cells.length; j++) {
+      if (cells[j].textContent.replace(/\s+/g, ' ').trim().toLowerCase() === target) return links[i];
+    }
+    if (!loose && row.textContent.replace(/\s+/g, ' ').toLowerCase().indexOf(target) >= 0) loose = links[i];
+  }
+  return loose;
+}
+
 function fundaeExtractToken(html) {
   var doc = new DOMParser().parseFromString(html, 'text/html');
   var box = doc.querySelector('#copytoclipboardtoken');
@@ -674,104 +846,139 @@ function fundaeExtractToken(html) {
   return m ? m[0] : '';
 }
 
-// Punto de entrada cuando no hay token guardado: intenta auto-conectar y, si
-// no es posible, ofrece el pegado manual como respaldo.
-function fundaeConnect() {
-  document.getElementById('fp-body').innerHTML =
-    '<div class="card fp-card"><div class="card-body" style="text-align:center;padding:48px 20px;">' +
-    '<div class="spinner-border text-primary" role="status" style="margin-bottom:10px;"></div>' +
-    '<div class="fp-muted">Conectando con Moodle con tu sesión…</div></div></div>';
-  fundaeProvisionToken().then(function (tok) {
-    setToken(tok, false); // sessionStorage: se renueva solo en la próxima sesión
-    fundaeRun();
-  }).catch(function (e) {
-    var msg;
-    if (e && e.message === 'no-service')
-      msg = 'No hemos podido conectar automáticamente: tu usuario aún no tiene acceso al servicio «' + SERVICE_NAME +
-            '» (pídeselo al administrador), o estás entrando como administrador del sitio (usa una cuenta de tutor). ' +
-            'Si tienes un token, puedes pegarlo manualmente:';
-    else
-      msg = 'No hemos podido obtener tu token automáticamente. Puedes pegarlo manualmente (ver instrucciones):';
-    fundaeTokenSetup(msg);
-  });
-}
-
-/* --- Gestión del token personal (en el navegador, nunca en el código) --- */
-
-function fundaeTokenSetup(msg) {
+// Pantalla de conexión. La generación del token NO se dispara sola: regenerar
+// invalida el token anterior, y eso no puede pasarle a nadie sin que lo pida.
+function fundaeConnectScreen(msg) {
   var w = M.cfg.wwwroot;
   var has = !!getToken();
   document.getElementById('fp-body').innerHTML =
     '<div class="card fp-card"><div class="card-body">' +
-    '<h5><span class="fp-h-ic">🔑</span>Conexión manual (respaldo)</h5>' +
+    '<h5><span class="fp-h-ic">' + ic('🔑') + '</span>Conectar con Moodle</h5>' +
     (msg ? '<div class="fp-error" style="margin-bottom:12px;">' + esc(msg) + '</div>' : '') +
-    '<p>Normalmente el panel se conecta solo con tu sesión y no tienes que hacer nada. ' +
-    'Si ves esta pantalla, la conexión automática no ha sido posible. Puedes ' +
-    '<a href="javascript:void(0)" onclick="fundaeConnect()"><strong>reintentar la conexión automática</strong></a> ' +
-    'o conectarte a mano con tu token personal. El token se guarda solo en este navegador ' +
-    '(por defecto se borra al cerrarlo; marca «Recordar» para conservarlo).</p>' +
-    '<ol style="line-height:1.8;">' +
-    '<li>Abre <a href="' + w + '/user/managetoken.php" target="_blank"><strong>Preferencias → Claves de seguridad</strong></a> (se abre en otra pestaña).</li>' +
-    '<li>Copia el token del servicio <strong>' + esc(SERVICE_NAME) + '</strong> (créalo si no existe).</li>' +
-    '<li>Pégalo aquí y pulsa <em>Guardar y conectar</em>:</li></ol>' +
-    '<div style="display:flex;gap:8px;flex-wrap:wrap;max-width:620px;">' +
-    '<input id="fp-token-input" type="password" class="fp-filter" style="flex:1 1 260px;max-width:none;margin:0;" ' +
-    'placeholder="Pega aquí tu token…" onkeydown="if(event.key===\'Enter\')fundaeTokenSave()">' +
-    '<button class="btn btn-sm fp-btn-save" onclick="fundaeTokenSave()">Guardar y conectar</button>' +
-    (has ? '<button class="btn btn-sm fp-btn-del" onclick="fundaeTokenForget()">Borrar token guardado</button>' : '') +
+    '<p>El panel consulta la API de Moodle con <strong>tu</strong> cuenta. Para ello necesita el token ' +
+    'personal del servicio <strong>' + esc(SERVICE_NAME) + '</strong>, que se guarda solo en este navegador.</p>' +
+    '<p class="fp-muted">Al pulsar «Conectar» se <strong>regenera</strong> tu token de ese servicio: el valor anterior ' +
+    'deja de funcionar. Solo afecta al servicio ' + esc(SERVICE_NAME) + '; ningún otro token tuyo se toca.</p>' +
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:14px 0;">' +
+    '<button type="button" class="btn btn-sm fp-btn-save" data-fp-action="connect">Conectar con mi cuenta</button>' +
+    (has ? '<button type="button" class="btn btn-sm fp-btn-del" data-fp-action="forget">Borrar token guardado</button>' : '') +
     '</div>' +
-    '<label class="fp-muted" style="display:flex;align-items:center;gap:6px;margin-top:10px;cursor:pointer;">' +
-    '<input type="checkbox" id="fp-token-remember"> Recordar en este navegador ' +
-    '(sin marcar, el token se borra al cerrar el navegador)</label>' +
-    '<p class="fp-muted" style="margin-top:12px;">🔒 Tu token equivale a tu acceso: no lo compartas ni lo pegues fuera de esta página. ' +
+    '<label class="fp-muted" style="display:flex;align-items:center;gap:6px;cursor:pointer;">' +
+    '<input type="checkbox" id="fp-token-session"> Guardar solo durante esta sesión del navegador ' +
+    '(tendrás que reconectar y regenerar el token cada día)</label>' +
+    '<details style="margin-top:18px;"><summary style="cursor:pointer;">Conexión manual (si la automática falla)</summary>' +
+    '<ol style="line-height:1.8;margin-top:10px;">' +
+    '<li>Abre <a href="' + esc(w) + '/user/managetoken.php" target="_blank" rel="noopener">' +
+    '<strong>Preferencias → Claves de seguridad</strong></a>.</li>' +
+    '<li>Copia el token del servicio <strong>' + esc(SERVICE_NAME) + '</strong> (créalo si no existe).</li>' +
+    '<li>Pégalo aquí:</li></ol>' +
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;max-width:620px;">' +
+    '<label class="fp-sr" for="fp-token-input">Token personal</label>' +
+    '<input id="fp-token-input" type="password" class="fp-filter" style="flex:1 1 260px;max-width:none;margin:0;" ' +
+    'placeholder="Pega aquí tu token…" autocomplete="off">' +
+    '<button type="button" class="btn btn-sm fp-btn-save" data-fp-action="save-token">Guardar y conectar</button>' +
+    '</div></details>' +
+    '<p class="fp-muted" style="margin-top:12px;">' + ic('🔒') + ' Tu token equivale a tu acceso: no lo compartas ni lo pegues fuera de esta página. ' +
     'Si el servicio <strong>' + esc(SERVICE_NAME) + '</strong> no aparece en Claves de seguridad, pide al administrador que autorice tu usuario (ver README).</p>' +
     '</div></div>';
   document.getElementById('fp-timestamp').textContent = '';
 }
 
+function fundaeSessionOnly() {
+  return !!(document.getElementById('fp-token-session') || {}).checked;
+}
+
+function fundaeConnect() {
+  var sessionOnly = fundaeSessionOnly();
+  fundaeLoading('Conectando con Moodle con tu sesión…');
+  fundaeProvisionToken().then(function (tok) {
+    if (!tok) throw new Error('no-value');
+    setToken(tok, sessionOnly);
+    fundaeRun();
+  }).catch(function (e) {
+    var msg;
+    if (e && e.message === 'no-service')
+      msg = 'No hay ningún token del servicio «' + SERVICE_NAME + '» en tu cuenta. Pide al administrador que ' +
+            'autorice tu usuario en ese servicio, o entra con una cuenta de tutor (las cuentas de administrador ' +
+            'del sitio no reciben tokens automáticos). Por seguridad, el panel no toca tokens de otros servicios.';
+    else
+      msg = 'No hemos podido obtener tu token automáticamente. Puedes pegarlo a mano en «Conexión manual».';
+    fundaeConnectScreen(msg);
+  });
+}
+
 function fundaeTokenSave() {
   var v = (document.getElementById('fp-token-input').value || '').trim();
   if (!v) return;
-  var remember = !!(document.getElementById('fp-token-remember') || {}).checked;
-  setToken(v, remember);
+  setToken(v, fundaeSessionOnly());
   fundaeRun();
 }
 
 function fundaeTokenForget() {
   setToken('');
-  fundaeTokenSetup('Token borrado de este navegador.');
+  fundaeConnectScreen('Token borrado de este navegador.');
 }
+
+/* ------------------------------------------------------------------ */
+/* Interacción                                                         */
+/* ------------------------------------------------------------------ */
 
 function fundaeSort(key) {
   if (fundaeData.sortKey === key) fundaeData.sortDir *= -1;
   else { fundaeData.sortKey = key; fundaeData.sortDir = 1; }
-  fundaeRender();
+  fundaeRenderTables();
 }
 
 function fundaeToggle(uid) {
   fundaeData.expanded[uid] = !fundaeData.expanded[uid];
-  fundaeRender();
+  fundaeRenderTables();
 }
 
 function fundaeToggleType(type) {
   fundaeData.expandedType[type] = !fundaeData.expandedType[type];
-  fundaeRender();
+  fundaeRenderTables();
 }
+
+/* ------------------------------------------------------------------ */
+/* Exportación CSV                                                     */
+/* ------------------------------------------------------------------ */
 
 function fundaeDownloadCsv(lines, name) {
   var blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+  var url = URL.createObjectURL(blob);
   var a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
+  a.href = url;
   a.download = name + '-curso-' + (fundaeData.course ? fundaeData.course.id : '') + '.csv';
+  a.style.display = 'none';
+  document.body.appendChild(a); // Firefox exige que el enlace esté en el DOM
   a.click();
-  URL.revokeObjectURL(a.href);
+  setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
 }
 
-function csvCell(v) { return '"' + String(v).replace(/"/g, '""') + '"'; }
+// Neutraliza la inyección de fórmulas: los nombres vienen de usuarios de
+// Moodle, y un alumno llamado «=HYPERLINK(...)» ejecutaría la fórmula en el
+// Excel de quien abra la evidencia. Los números se dejan intactos para que
+// Excel siga tratándolos como números.
+function csvCell(v) {
+  var s = String(v == null ? '' : v);
+  if (/^[=+\-@\t\r]/.test(s) && !/^-?\d+([.,]\d+)?$/.test(s)) s = "'" + s;
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+// Aviso único por carga antes de sacar datos personales del navegador.
+function fundaeCsvConsent() {
+  if (fundaeData.csvWarned) return true;
+  var ok = window.confirm(
+    'El archivo contiene datos personales del alumnado: nombre, correo y patrón horario de conexión.\n\n' +
+    'Descárgalo solo si tienes base legal para tratarlos y guárdalo según la política de tu entidad.\n\n' +
+    '¿Continuar con la descarga?');
+  if (ok) fundaeData.csvWarned = true;
+  return ok;
+}
 
 function fundaeCsv() {
   var s = fundaeData.students;
-  if (!s.length) return;
+  if (!s.length || !fundaeCsvConsent()) return;
   var head = ['Alumno', 'Email', 'Ultimo acceso', 'Dias sin acceso', 'Tiempo en curso (min)', 'Sesiones',
     'Progreso actividades (%)', 'Curso completado', 'Nota final'];
   var lines = [head.join(';')].concat(s.map(function (st) {
@@ -789,7 +996,7 @@ function fundaeCsv() {
 // CSV con una fila por alumno y día: la evidencia de conexiones diarias.
 function fundaeCsvDays() {
   var s = fundaeData.students;
-  if (!s.length) return;
+  if (!s.length || !fundaeCsvConsent()) return;
   var head = ['Alumno', 'Email', 'Dia', 'Sesiones', 'Tiempo (min)'];
   var lines = [head.join(';')];
   s.forEach(function (st) {
@@ -803,6 +1010,191 @@ function fundaeCsvDays() {
   fundaeDownloadCsv(lines, 'conexiones-diarias-fundae');
 }
 
-// Se ejecuta en cada carga de la página → datos siempre frescos.
-fundaeRun();
+/* ------------------------------------------------------------------ */
+/* Arranque                                                            */
+/* ------------------------------------------------------------------ */
+
+var FUNDAE_CSS = [
+  '#fundae-panel{max-width:1140px;margin:0 auto;--fp-blue:#0f6cbf;--fp-purple:#5b3fc5;}',
+
+  '#fundae-panel .fp-hero{background:linear-gradient(120deg,#0f6cbf 0%,#5b3fc5 100%);color:#fff;border-radius:14px;padding:16px 20px;margin-bottom:16px;box-shadow:0 4px 18px rgba(30,50,110,.18);}',
+  '#fundae-panel .fp-hero-top{display:flex;flex-wrap:wrap;align-items:center;gap:10px;}',
+  '#fundae-panel .fp-hero h2{margin:0;font-weight:700;font-size:1.4rem;letter-spacing:-.01em;color:#fff;flex:1 1 auto;}',
+  '#fundae-panel .fp-hero .fp-sub{opacity:.9;font-size:.85em;margin-top:4px;}',
+  '#fundae-panel .fp-hero .fp-chips{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;}',
+  '#fundae-panel .fp-chip{background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.25);border-radius:50rem;padding:2px 12px;font-size:.78em;}',
+  '#fundae-panel .fp-toolbar{display:flex;flex-wrap:wrap;gap:6px;}',
+  '#fundae-panel .fp-toolbar .btn{border-radius:50rem;font-size:.8em;padding:3px 14px;}',
+  '#fundae-panel .fp-btn-light{background:#fff;color:#0f6cbf;border:1px solid #fff;}',
+  '#fundae-panel .fp-btn-ghost{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.6);}',
+  '#fundae-panel .fp-btn-ghost:hover{background:rgba(255,255,255,.15);color:#fff;}',
+  '#fundae-panel .fp-btn-save{background:#0f6cbf;color:#fff;border:1px solid #0f6cbf;border-radius:50rem;font-size:.85em;padding:5px 18px;}',
+  '#fundae-panel .fp-btn-save:hover{background:#0c5aa0;color:#fff;}',
+  '#fundae-panel .fp-btn-del{background:#fff;color:#b3261e;border:1px solid #b3261e;border-radius:50rem;font-size:.85em;padding:5px 18px;}',
+
+  '#fundae-panel .fp-card{border:0;border-radius:14px;background:#fff;box-shadow:0 2px 10px rgba(25,40,80,.08);margin-bottom:18px;}',
+  '#fundae-panel .fp-card .card-body{padding:20px 22px;}',
+  '#fundae-panel .fp-card h5{font-weight:700;display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap;}',
+  '#fundae-panel .fp-card h5 .fp-h-ic{width:32px;height:32px;border-radius:10px;display:inline-flex;align-items:center;justify-content:center;font-size:1rem;background:rgba(15,108,191,.12);}',
+
+  '#fundae-panel .fp-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px;}',
+  '#fundae-panel .fp-kpi{text-align:center;padding:12px 8px 10px;margin-bottom:0;}',
+  '#fundae-panel .fp-kpi .fp-ic{width:36px;height:36px;margin:0 auto 6px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.05rem;background:linear-gradient(135deg,rgba(15,108,191,.14),rgba(91,63,197,.14));}',
+  '#fundae-panel .fp-kpi .fp-num{font-size:1.4em;font-weight:800;line-height:1.1;color:#1d2b45;}',
+  '#fundae-panel .fp-kpi .fp-lbl{color:#5c6779;font-size:.7em;text-transform:uppercase;letter-spacing:.06em;margin-top:2px;}',
+
+  '#fundae-panel table{font-size:.95em;width:100%;}',
+  '#fundae-panel table thead th{border-top:0;border-bottom:2px solid #eef1f6;color:#5c6779;font-size:.78em;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap;padding:9px 10px;text-align:left;}',
+  '#fundae-panel table td{vertical-align:middle;border-color:#f1f3f8;padding:9px 10px;}',
+  '#fundae-panel th.fp-sortable{cursor:pointer;user-select:none;}',
+  '#fundae-panel th.fp-sortable:hover,#fundae-panel th.fp-sortable:focus{color:#0f6cbf;outline-offset:2px;}',
+  '#fundae-panel .fp-scroll{max-height:480px;overflow:auto;}',
+  '#fundae-panel .fp-scroll thead th{position:sticky;top:0;background:#fff;z-index:1;}',
+
+  '#fundae-panel .badge{border-radius:50rem;padding:.35em .8em;font-weight:600;}',
+  '#fundae-panel .fp-ok{background:#1b7e2c;color:#fff;}',
+  '#fundae-panel .fp-warn{background:#f5c211;color:#3d3000;}',
+  '#fundae-panel .fp-fail{background:#b3261e;color:#fff;}',
+  '#fundae-panel .fp-neutral{background:#e4e8f0;color:#43506b;}',
+  '#fundae-panel .fp-info{background:#cfe6f8;color:#0b4a7a;}',
+
+  '#fundae-panel .progress{border-radius:50rem;height:16px;background:#eef1f6;min-width:110px;overflow:hidden;display:flex;}',
+  '#fundae-panel .progress-bar{font-size:.72em;font-weight:700;border-radius:50rem;color:#fff;display:flex;align-items:center;justify-content:center;}',
+  '#fundae-panel .fp-bar-ok{background:#1b7e2c;}#fundae-panel .fp-bar-warn{background:#a06e00;}#fundae-panel .fp-bar-fail{background:#b3261e;}',
+
+  '#fundae-panel .fp-av{width:32px;height:32px;border-radius:50%;display:inline-flex;flex:0 0 32px;align-items:center;justify-content:center;color:#fff;font-size:.72em;font-weight:700;}',
+  '#fundae-panel .fp-stu{display:flex;align-items:center;gap:10px;}',
+
+  '#fundae-panel button.fp-tg{color:inherit;background:none;border:0;padding:0;font:inherit;font-weight:600;cursor:pointer;text-align:left;}',
+  '#fundae-panel button.fp-tg:hover,#fundae-panel button.fp-tg:focus{color:#0f6cbf;}',
+  '#fundae-panel .fp-car{display:inline-block;transition:transform .15s;color:#0f6cbf;}',
+  '#fundae-panel .fp-car.open{transform:rotate(90deg);}',
+  '#fundae-panel tr.fp-detail > td{background:#f8fafd;}',
+
+  '#fundae-panel .fp-links{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;}',
+  '#fundae-panel .fp-link{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:12px;border:1px solid #e7ebf3;text-decoration:none;color:#1d2b45;background:#fff;transition:box-shadow .15s,transform .15s;}',
+  '#fundae-panel .fp-link:hover{box-shadow:0 4px 14px rgba(25,40,80,.12);transform:translateY(-1px);text-decoration:none;color:#1d2b45;}',
+  '#fundae-panel .fp-link .fp-l-ic{width:36px;height:36px;border-radius:10px;flex:0 0 36px;display:flex;align-items:center;justify-content:center;font-size:1.05rem;background:rgba(15,108,191,.1);}',
+  '#fundae-panel .fp-link b{font-size:.85em;display:block;line-height:1.2;}',
+  '#fundae-panel .fp-link small{color:#5c6779;font-size:.72em;}',
+
+  '#fundae-panel .fp-muted{color:#5c6779;font-size:.85em;}',
+  '#fundae-panel .fp-error{padding:14px 16px;background:#fdecea;border:1px solid #f2b8b5;color:#8c1d18;border-radius:12px;}',
+  '#fundae-panel .fp-filter{max-width:230px;margin-left:auto;border-radius:50rem;border:1px solid #dde3ee;padding:4px 14px;font-size:.85em;}',
+  '#fundae-panel .fp-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;}',
+
+  '@media print{#fundae-panel .fp-noprint{display:none !important;}',
+  '#fundae-panel .fp-hero{background:#fff !important;color:#000;border:1px solid #ddd;box-shadow:none;}',
+  '#fundae-panel .fp-hero h2{color:#000;}',
+  '#fundae-panel .fp-chip{border-color:#bbb;background:#f5f5f5;}',
+  '#fundae-panel .fp-card{box-shadow:none;border:1px solid #ddd;}',
+  '#fundae-panel .fp-scroll{max-height:none;overflow:visible;}}'
+].join('\n');
+
+// Delegación de eventos: sin atributos onclick en el HTML generado, para que
+// el panel siga funcionando si el sitio activa una CSP sin 'unsafe-inline'.
+var FUNDAE_ACTIONS = {
+  'refresh': function () { fundaeRun(); },
+  'csv': function () { fundaeCsv(); },
+  'csv-days': function () { fundaeCsvDays(); },
+  'print': function () { window.print(); },
+  'token': function () { fundaeConnectScreen(); },
+  'connect': function () { fundaeConnect(); },
+  'forget': function () { fundaeTokenForget(); },
+  'save-token': function () { fundaeTokenSave(); },
+  'sort': function (el) { fundaeSort(el.getAttribute('data-fp-key')); },
+  'toggle-student': function (el) { fundaeToggle(parseInt(el.getAttribute('data-fp-uid'), 10)); },
+  'toggle-type': function (el) { fundaeToggleType(el.getAttribute('data-fp-type')); }
+};
+
+function fundaeHandle(ev) {
+  var el = ev.target.closest ? ev.target.closest('[data-fp-action]') : null;
+  if (!el) return;
+  var fn = FUNDAE_ACTIONS[el.getAttribute('data-fp-action')];
+  if (!fn) return;
+  ev.preventDefault();
+  fn(el);
+}
+
+function fundaeDebounce(fn, ms) {
+  var t;
+  return function () { clearTimeout(t); t = setTimeout(fn, ms); };
+}
+
+function fundaeBoot() {
+  var root = document.getElementById('fundae-panel');
+  if (!root) return;
+
+  var tag = document.createElement('style');
+  tag.textContent = FUNDAE_CSS;
+  document.head.appendChild(tag);
+
+  root.innerHTML =
+    '<div class="fp-hero">' +
+    '<div class="fp-hero-top">' +
+    '<h2>' + ic('📋') + ' Panel de evidencias FUNDAE</h2>' +
+    '<div class="fp-toolbar fp-noprint">' +
+    '<button type="button" class="btn btn-sm fp-btn-light" data-fp-action="refresh">⟳ Actualizar</button>' +
+    '<button type="button" class="btn btn-sm fp-btn-ghost" data-fp-action="csv">⬇ CSV resumen</button>' +
+    '<button type="button" class="btn btn-sm fp-btn-ghost" data-fp-action="csv-days">⬇ CSV por días</button>' +
+    '<button type="button" class="btn btn-sm fp-btn-ghost" data-fp-action="print">🖨 Imprimir</button>' +
+    '<button type="button" class="btn btn-sm fp-btn-ghost" data-fp-action="token" ' +
+    'title="Conectar, cambiar o borrar el token guardado en este navegador">🔑</button>' +
+    '</div></div>' +
+    '<div class="fp-sub">Seguimiento de teleformación bonificada · trazabilidad, evaluación y tutorización</div>' +
+    '<div class="fp-chips" id="fp-chips"><span class="fp-chip">Cargando curso…</span></div>' +
+    '<div class="fp-sub" id="fp-timestamp"></div>' +
+    '</div>' +
+    '<div id="fp-body"></div>';
+
+  root.addEventListener('click', fundaeHandle);
+  root.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    var el = ev.target.closest ? ev.target.closest('[data-fp-action]') : null;
+    if (el && el.tagName === 'TH') fundaeHandle(ev);
+    if (ev.target.id === 'fp-token-input' && ev.key === 'Enter') { ev.preventDefault(); fundaeTokenSave(); }
+  });
+  var debounced = fundaeDebounce(fundaeRenderTables, 150);
+  root.addEventListener('input', function (ev) {
+    if (ev.target.id === 'fp-filter' || ev.target.id === 'fp-modfilter') debounced();
+  });
+
+  // Guarda de rol: el alumnado no tiene report/log:view. Sin esta comprobación,
+  // un estudiante que abriera la página vería la pantalla de conexión.
+  var courseid = fundaeCourseId();
+  if (!courseid) { fundaeRun(); return; }
+  if (getToken()) { fundaeRun(); return; }
+  fundaeLoading('Comprobando permisos…');
+  fundaeCanViewLogs(courseid).then(function (ok) {
+    if (ok) { fundaeRun(); return; }
+    document.getElementById('fp-body').innerHTML =
+      '<div class="card fp-card"><div class="card-body">' +
+      '<p>Este panel muestra el seguimiento del curso y está destinado al profesorado. ' +
+      'Tu cuenta no tiene permiso para ver los registros de este curso.</p>' +
+      '<p class="fp-muted">Si eres tutor o tutora del curso y crees que es un error, ' +
+      '<button type="button" class="fp-tg" data-fp-action="refresh">continúa de todos modos</button>.</p>' +
+      '</div></div>';
+  });
+}
+
+fundaeBoot();
+
+/* Exporta las funciones puras para las pruebas unitarias (test/). En el
+ * navegador no existe `module`, así que este bloque no hace nada al pegar
+ * el panel en Moodle. */
+if (typeof module === 'object' && module && module.exports) {
+  module.exports = {
+    esc: esc, fmtDur: fmtDur, csvCell: csvCell,
+    fundaePool: fundaePool, fundaeRetry: fundaeRetry,
+    fundaeParseLogValue: fundaeParseLogValue, fundaeResolveDateOrder: fundaeResolveDateOrder,
+    fundaePartsToTs: fundaePartsToTs, fundaeTimeCell: fundaeTimeCell,
+    fundaeSessions: fundaeSessions, fundaeByDay: fundaeByDay,
+    fundaeIsStudent: fundaeIsStudent, fundaeFindServiceLink: fundaeFindServiceLink,
+    // Para la prueba de humo del renderizado (test/render.test.js).
+    fundaeBoot: fundaeBoot, fundaeBuild: fundaeBuild,
+    fundaeRenderTables: fundaeRenderTables, fundaeSort: fundaeSort,
+    fundaeToggle: fundaeToggle, fundaeToggleType: fundaeToggleType,
+    fundaeData: fundaeData
+  };
+}
 </script>

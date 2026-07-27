@@ -73,8 +73,11 @@ real. Estos son los hitos en orden:
 | 14 | Pregunta sobre cookies para ocultar el token | Analizado y descartado (no aporta seguridad) |
 | 15 | Opción `sessionStorage` vs `localStorage` («Recordar») | — |
 | 16 | **UX inaceptable** del pegado manual del token | Resuelto: auto-conexión silenciosa (v3.0) |
+| 17 | **Revisión completa del código** de la v3.0 | Cinco defectos bloqueantes y diez importantes (ver §9) |
+| 18 | La auto-conexión resultó ser el problema, no la solución | Conexión con un clic y sin tocar tokens ajenos (v4.0) |
+| 19 | Ingeniería del proyecto: licencia, pruebas, CI, RGPD | Repositorio en condiciones de mantenerse |
 
-Los hitos 1, 13 y 16 marcan los tres saltos de versión (ver §7).
+Los hitos 1, 13, 16 y 18 marcan los cuatro saltos de versión (ver §7).
 
 ---
 
@@ -248,32 +251,34 @@ del proyecto. Cada versión es funcional y autónoma.
 
 | Versión | Modelo de conexión | UX del tutor | Seguridad |
 |---------|--------------------|--------------|-----------|
-| **v1.0** | Token de servicio **incrustado** en el código | Ninguna acción (token ya puesto) | ❌ Token expuesto en el frontend |
+| **v1.0** | Token de servicio **incrustado** en el código | Ninguna acción (token ya puesto) | ⛔ Token expuesto en el frontend |
 | **v2.0** | **Token personal** por tutor, **pegado manual** | Copiar/pegar el token una vez | ✅ Sin escalada; mal UX |
-| **v3.0** | Token personal **auto-obtenido** por la sesión | **Ninguna acción** | ✅ Sin escalada; buen UX |
+| **v3.0** | Token personal **auto-obtenido** por la sesión | Ninguna acción | ⛔ Rota tokens ajenos y sin consentimiento |
+| **v4.0** | Token personal, obtenido **con un clic** | Un clic la primera vez | ✅ Sin escalada, con consentimiento |
 
-Las tres comparten **el mismo conjunto de funcionalidades** de informe
+Las cuatro comparten **el mismo conjunto de funcionalidades** de informe
 (checklist de 12 puntos, inventario de actividades/SCORM, tiempo de conexión por
 sesiones y días, tabla por alumno, filtros, CSV, enlaces a informes oficiales,
-CSS inyectado desde JS). **Solo cambia cómo se autentica el panel.**
+CSS inyectado desde JS). Lo que cambia entre v1.0 y v3.0 es solo **cómo se
+autentica el panel**; la v4.0 añade además las correcciones de §9.
 
 Código de cada versión:
 
-- [`versions/panel-fundae-v1.0.html`](versions/panel-fundae-v1.0.html)
-- [`versions/panel-fundae-v2.0.html`](versions/panel-fundae-v2.0.html)
-- [`versions/panel-fundae-v3.0.html`](versions/panel-fundae-v3.0.html) (= `panel-fundae.html`, la actual)
+- [`panel-fundae.html`](panel-fundae.html) — v4.0, la única mantenida
+- [`versions/`](versions/) — v1.0, v2.0 y v3.0, **congeladas**
 
-> **Por qué se conservan v1.0 y v2.0**: v1.0 es la más simple de desplegar en un
-> entorno de pruebas cerrado y controlado (un solo token, sin pasos por tutor),
-> útil como demo rápida. v2.0 sirve donde la auto-conexión no aplique (p. ej.
-> políticas que impidan la regeneración automática de tokens, o pruebas con
-> cuentas de administrador). v3.0 es la recomendada para uso real.
+> **Por qué la v3.0 dejó de ser recomendable.** Se conserva por trazabilidad del
+> proceso, no como alternativa: la revisión encontró que su auto-conexión podía
+> apropiarse del token de otro servicio del tutor y que regeneraba credenciales
+> sin que nadie lo pidiera (§9). La v1.0 tampoco debe desplegarse. Los detalles
+> están en [`versions/README.md`](versions/README.md).
 
 ---
 
 ## 8. Limitaciones de la PoC y camino a producción
 
 - **Tiempo de conexión** = estimación por sesiones de log, no medición exacta.
+  Además depende de que el formato de fecha del sitio sea desambiguable (§9).
 - **Límite** de `MAX_ALUMNOS` (100) consultados por carga.
 - **Calificación "configurada"** = el módulo tiene ítem en el libro con nota
   máxima > 0; el detalle fino (método de calificación de un SCORM, etc.) no lo
@@ -281,14 +286,131 @@ Código de cada versión:
 - **El token sigue en el navegador**: aceptable para la PoC; la eliminación
   total del secreto requiere componente de servidor.
 
-Evolución natural (fuera del alcance "sin plugins"):
+### Dirección elegida: LTI 1.3 Advantage
 
-1. **Puente PHP en servidor** (un archivo junto a Moodle, sin instalar plugin):
-   `require_login()` + comprobación de capability + consulta en servidor con la
-   sesión del tutor. Elimina los tokens del cliente.
-2. **Plugin local** (`local_fundae`): función web service propia que calcula el
-   informe en servidor (incluidos tiempos reales desde el log store), comprueba
-   la capability y devuelve el resultado ya calculado. El panel solo pinta.
-3. **Bloque instalable** (`block_fundae`): control de visibilidad por capability
-   sin depender de "contenido confiable" ni de pegar HTML.
-4. **Informes descargables firmados** (PDF/XLSX) como evidencia formal ante FUNDAE.
+De las alternativas evaluadas, la decisión de proyecto es **sacar el panel de
+Moodle como herramienta LTI 1.3**. Es la única opción que conserva la
+restricción de "sin plugins" —el consumidor LTI 1.3 es núcleo de Moodle y se
+configura como *Herramienta externa*— y a la vez elimina el secreto del cliente:
+
+- El *launch* llega firmado (JWT) con identidad, **rol** y contexto del curso:
+  la autorización deja de depender de que el recurso esté oculto, y desaparece
+  la detección del id de curso desde la URL.
+- **NRPS** (Names and Role Provisioning Service) entrega el alumnado con sus
+  roles, en sustitución de `core_enrol_get_enrolled_users`.
+- Desaparecen de golpe los cuatro defectos de gestión de token de §9: no hay
+  token en el navegador que robar, rotar ni apropiarse.
+- Los tiempos se calculan en servidor, cacheados, sin estampida y sin analizar
+  HTML localizado.
+- Un solo despliegue sirve a **varios Moodle de varios clientes**: es el camino
+  de PoC a producto.
+
+Dos cosas hay que **verificar antes de comprometerse**, no darlas por hechas:
+
+1. **Alcance real de AGS en Moodle como plataforma**: si expone los *line items*
+   de todo el libro de calificaciones o solo los de la propia actividad LTI. Si
+   es lo segundo, las notas seguirán necesitando la API REST con un token de
+   servicio guardado **en el backend** (aceptable: servidor, no navegador).
+2. **Registros**: `report/log` no tiene equivalente LTI. Los tiempos exactos
+   requerirán REST o, para precisión real, un `local_fundae` opcional que
+   consulte `logstore_standard_log`.
+
+Alternativas descartadas y su motivo:
+
+1. **Puente PHP en servidor** (un archivo junto a Moodle): elimina los tokens
+   del cliente, pero exige acceso al sistema de archivos del servidor de cada
+   cliente y no escala a varios Moodle.
+2. **Plugin local** (`local_fundae`): la vía canónica y la única que da tiempos
+   exactos, pero rompe la restricción de "sin plugins" y obliga a instalar y
+   mantener código en el Moodle de cada cliente. Queda como complemento
+   opcional de la herramienta LTI, no como base.
+3. **Bloque instalable** (`block_fundae`): mismo problema de instalación.
+
+Pendiente en cualquiera de los caminos: **informes descargables firmados**
+(PDF/XLSX con sello temporal y hash) como evidencia formal ante FUNDAE. Un CSV
+editable es una evidencia débil.
+
+---
+
+## 9. La revisión de la v3.0
+
+La v3.0 cerraba bien el problema que se había planteado —eliminar el secreto
+compartido— pero la revisión posterior del código encontró que la solución de
+UX (auto-conexión) había introducido problemas propios, y que había defectos de
+escala y de correctitud que no se habían buscado nunca.
+
+### 9.1 La auto-conexión era el problema
+
+Tres defectos, todos en el mismo mecanismo:
+
+**Se apropiaba de tokens ajenos.** El código tenía un respaldo razonable sobre
+el papel: «si no encuentro la fila del servicio FUNDAE pero el tutor tiene
+exactamente un token, será ese». En la práctica, el token que casi todos los
+tutores tienen es el de **Moodle Mobile**. El panel lo regeneraba y se lo
+quedaba: el tutor se encontraba la app móvil desconectada sin explicación. El
+respaldo se ha eliminado por completo.
+
+**Regeneraba sin permiso.** Leer el valor de un token en Moodle exige
+regenerarlo, y eso invalida el anterior. La v3.0 lo hacía **al cargar la
+página**: un cambio de estado irreversible que el usuario sufría sin pedirlo.
+Bastaba con que alguien le hiciera abrir la Página. Ahora hace falta un clic.
+
+**Rotaba en cada pestaña.** El token se guardaba en `sessionStorage`, que es por
+pestaña. Abrir el panel en dos pestañas producía dos regeneraciones y dejaba la
+primera con un token muerto a mitad de carga. La v4.0 usa `localStorage`, que sí
+se comparte. Es un cambio de postura consciente: se acepta una ventana de
+exposición mayor a cambio de eliminar la rotación constante, porque el modelo de
+amenazas no cambia (un XSS lee ambos por igual).
+
+La lección es que **la comodidad no justifica actuar sobre las credenciales de
+alguien sin decírselo**. La v4.0 conserva casi toda la ventaja de UX —un clic,
+una vez— sin ninguno de los tres problemas.
+
+### 9.2 El panel podía tumbar el Moodle que estaba midiendo
+
+`Promise.all` sobre 100 alumnos × 3 peticiones = ~300 concurrentes, y 100 de
+ellas eran descargas completas de `report/log`, de las consultas más caras de
+Moodle. En un curso con historial real eso satura la cola de PHP-FPM y afecta a
+todos los usuarios del sitio. Ahora hay un pool de 5 en vuelo, progreso visible
+y reintentos con espera creciente.
+
+### 9.3 El dato que más importa era el más frágil
+
+Los tiempos de conexión —lo que FUNDAE realmente exige acreditar— se calculaban
+analizando la fecha **ya formateada en el idioma del sitio** con una expresión
+regular que asumía `d/m/aa`, tomando la primera columna del informe por
+posición. En un sitio en inglés (`m/d/aa`) día y mes se intercambiaban en
+silencio: salían tiempos plausibles y falsos.
+
+Un informe de horas que miente es peor que uno que dice «n/d». Ahora el orden se
+deduce del conjunto completo de registros y, cuando no se puede determinar, el
+panel **declara la estimación como no verificada** en vez de dar una cifra.
+
+A eso se sumaba que una sesión con un solo evento contaba **cero segundos**, lo
+que infravaloraba sistemáticamente las horas acreditadas: de ahí
+`SESSION_MIN_SEC`.
+
+### 9.4 El resto
+
+- **CSV inyectable por fórmula**: un alumno llamado `=HYPERLINK(...)` ejecutaba
+  código en el Excel de quien abriera la evidencia.
+- **Inventario de calificaciones tomado de un solo alumno**, lo que falseaba la
+  evidencia nº 8 si a ese alumno le ocultaban ítems.
+- **Detección de notas y de rol de alumnado dependientes del idioma** del sitio.
+- **Sin guarda de rol**: si la Página dejaba de estar oculta, el alumnado veía
+  la pantalla de conexión.
+- **Filtros que rehacían todo el DOM en cada tecla**, con un parche para
+  devolver el foco a mano.
+
+### 9.5 Lo que faltaba como proyecto
+
+No había licencia, ni pruebas, ni CI: nada impedía que cualquiera de los
+defectos anteriores volviera a colarse. Y el historial de git conservaba —y
+sigue conservando hasta que se purgue— un paquete SCORM de 26 MB de contenido de
+curso, subido y borrado, en un repositorio **público**.
+
+El código del panel no se puede trocear en módulos sin perder lo que lo hace
+desplegable (un archivo que se pega tal cual), así que las pruebas extraen el
+`<script>` del propio HTML y lo evalúan aislado. Se mantiene una única fuente de
+verdad y se gana cobertura sobre las funciones de cálculo, que es donde estaban
+casi todos los errores.

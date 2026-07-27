@@ -1,0 +1,23 @@
+{
+  "name": "poc-fundae",
+  "version": "4.0.0",
+  "private": true,
+  "description": "Panel de evidencias FUNDAE para Moodle 4.5 / 5, sin plugins",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "pretest": "node scripts/extract-inline.mjs",
+    "prelint": "node scripts/extract-inline.mjs",
+    "lint": "eslint .",
+    "check": "npm run lint && npm run test"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.13.0",
+    "eslint": "^9.13.0",
+    "globals": "^15.11.0",
+    "jsdom": "^30.0.0",
+    "vitest": "^2.1.4"
+  }
+}

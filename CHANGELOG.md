@@ -10,10 +10,111 @@ en uso (`panel-fundae.html`) es siempre la más reciente.
 
 ---
 
-## [3.0.0] — Auto-conexión (versión actual)
+## [4.0.0] — Conexión con consentimiento y correcciones de seguridad (versión actual)
 
-Archivo: [`versions/panel-fundae-v3.0.html`](versions/panel-fundae-v3.0.html)
-· también publicado como `panel-fundae.html`.
+Archivo: [`panel-fundae.html`](panel-fundae.html).
+
+Revisión completa del código de la v3.0. El número mayor sube porque **cambia
+el modelo de conexión**: obtener el token deja de ser automático.
+
+### Seguridad
+
+- **Corregido: el panel podía apropiarse del token de otro servicio.** Cuando no
+  encontraba el del servicio FUNDAE y el tutor tenía exactamente un token,
+  usaba ese: lo **regeneraba** y lo empleaba. En la práctica se quedaba con el
+  token de la app móvil del tutor y se la dejaba rota. Se ha eliminado ese
+  respaldo: ahora exige coincidencia con `SERVICE_NAME` o no hace nada.
+- **Corregido: la regeneración del token ya no se dispara sola.** Regenerar
+  invalida el token anterior, así que es una acción destructiva y ahora
+  requiere pulsar «Conectar con mi cuenta», con aviso previo de lo que implica.
+- **Corregido: inyección de fórmulas en los CSV.** Los nombres vienen de
+  usuarios de Moodle; uno llamado `=HYPERLINK(...)` ejecutaba la fórmula en el
+  Excel de quien abriera la evidencia. Las celdas que empiezan por `=`, `+`,
+  `-`, `@`, tabulador o retorno se prefijan con un apóstrofo (los números
+  negativos se dejan como números).
+- **Añadida guarda de rol**: antes de mostrar nada se comprueba
+  `report/log:view`. Si la Página deja de estar oculta, el alumnado ve un
+  mensaje neutro en vez de la pantalla de conexión.
+- `esc()` escapa también la comilla simple y la barra.
+- Los `onclick` en línea se sustituyen por delegación de eventos, de modo que
+  el panel sigue funcionando con una CSP sin `unsafe-inline`.
+- Los enlaces con `target="_blank"` llevan `rel="noopener"`.
+
+### Corregido
+
+- **Estampida de peticiones**: hasta ~300 llamadas simultáneas contra el propio
+  Moodle (100 de ellas descargas completas de registros) podían dejar el sitio
+  sin responder. Ahora hay un pool con `CONCURRENCY` (5) peticiones en vuelo,
+  barra de progreso y reintentos con espera creciente ante errores de red.
+- **Tiempos falsos por el idioma del sitio**: la fecha del informe de registros
+  se analizaba asumiendo `d/m/aa`. En un sitio en inglés (`m/d/aa`) día y mes se
+  intercambiaban en silencio. Ahora el orden se deduce del conjunto completo de
+  registros y, si es indeterminable, el panel marca el tiempo como **estimación
+  sin verificar** en vez de dar una cifra falsa. Se acepta también formato ISO.
+- **Columna de hora localizada por nombre de cabecera**, no por posición.
+- **Sesiones de un solo evento contaban cero segundos**, infravalorando las
+  horas acreditadas. Nueva constante `SESSION_MIN_SEC` (60 s por sesión).
+- **Inventario de calificaciones tomado de un solo alumno**: si a ese alumno le
+  ocultaban ítems, el estado «calificación configurada» salía mal para todo el
+  curso. Ahora se usa la unión de todos los alumnos.
+- **Detección de notas dependiente del idioma**: se comparaba el texto contra
+  «-». Ahora se usa `graderaw`.
+- **Detección de alumnado**: además de `student`, se aceptan roles renombrados
+  o clonados (`alumno`, `estudiante`, `student_*`, `alumn*`), configurables en
+  `STUDENT_ROLES`.
+- **Id del curso** vía `M.cfg.courseId`, con los métodos anteriores de respaldo.
+- **Descarga de CSV**: el enlace se inserta en el DOM y la URL se libera con
+  retardo; sin ello la descarga fallaba en algunos navegadores.
+- **Filtros**: ya no se rehace todo el DOM en cada tecla. El esqueleto se pinta
+  una vez y solo se repintan los `<tbody>`, con retardo de 150 ms. Desaparece
+  el parche que devolvía el foco a mano.
+
+### Cambiado
+
+- **El token se guarda en `localStorage` por defecto** (antes `sessionStorage`).
+  Es el único almacenamiento compartido entre pestañas: con `sessionStorage`,
+  cada pestaña nueva regeneraba su propio token e invalidaba el de las demás.
+  La casilla *Guardar solo durante esta sesión* mantiene el comportamiento
+  anterior.
+
+### Accesibilidad
+
+- `scope` en las cabeceras de tabla, `aria-sort` en las columnas ordenables,
+  `aria-expanded` en los desplegables y `<caption>` oculta en cada tabla.
+- Los desplegables pasan a ser `<button>` en lugar de `javascript:void(0)`, con
+  activación por teclado.
+- El emoji decorativo se oculta a los lectores de pantalla.
+- Se sube el contraste del texto atenuado y de la barra de progreso intermedia.
+
+### Protección de datos
+
+- Aviso antes de cada exportación a CSV y nota permanente en el panel: los
+  datos que salen son personales.
+- Sección **RGPD** en el README (base legal, minimización, conservación,
+  encargo de tratamiento).
+
+### Proyecto
+
+- `LICENSE` (MIT), `.editorconfig`, ESLint y pruebas unitarias con Vitest
+  (43 casos), más CI en GitHub Actions.
+- Las pruebas extraen el `<script>` del propio HTML: sigue habiendo **un solo
+  archivo** que pegar en Moodle, sin paso de compilación ni copias que
+  desincronizar.
+- `scripts/purgar-historial.sh` para eliminar del historial de git el paquete
+  SCORM de 26 MB que se subió y se borró (borrarlo no lo quitó del historial).
+- `.gitignore` ampliado: nunca más `*.zip` ni `*.mbz` en el repositorio.
+- `versions/README.md` advierte de que v1.0 y v3.0 tienen defectos conocidos y
+  no deben desplegarse.
+
+---
+
+## [3.0.0] — Auto-conexión
+
+Archivo: [`versions/panel-fundae-v3.0.html`](versions/panel-fundae-v3.0.html).
+
+> ⛔ **No desplegar.** La revisión de la v4.0 encontró dos defectos graves en
+> esta versión: podía apropiarse del token de otro servicio del tutor, y
+> regeneraba el token sin que nadie lo pidiera. Ver v4.0.
 
 ### Añadido
 - **Auto-conexión silenciosa**: el panel obtiene el token del tutor usando su

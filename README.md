@@ -34,19 +34,35 @@ protocolo **REST con token** (`/webservice/rest/server.php`).
 **El código del panel NO contiene ningún token.** Cada tutor se conecta con su
 **token personal**, que queda guardado solo en su navegador, nunca en la página.
 
-**Conexión automática (el tutor no hace nada).** Al abrir la página, el panel
-obtiene el token del tutor usando su propia sesión: replica con `fetch`
-(same-origin, con la cookie del tutor) el gesto que Moodle hace al visitar
-*Preferencias → Claves de seguridad* (`/user/managetoken.php`), donde el token
-del servicio se **auto-genera** y su valor se devuelve al regenerarlo con el
-`sesskey`. Es exactamente lo que el tutor haría a mano; no escala privilegios
-(usa su sesión y sus permisos). El token se guarda en `sessionStorage` (se
-borra al cerrar el navegador; en la siguiente sesión se vuelve a obtener solo).
+**Conexión con un clic.** La primera vez, el panel muestra un botón *Conectar
+con mi cuenta*. Al pulsarlo obtiene el token del tutor usando su propia sesión:
+replica con `fetch` (same-origin, con la cookie del tutor) el gesto que Moodle
+hace al visitar *Preferencias → Claves de seguridad*
+(`/user/managetoken.php`), donde el token del servicio se **auto-genera** y su
+valor se devuelve al regenerarlo con el `sesskey`. Es exactamente lo que el
+tutor haría a mano; no escala privilegios (usa su sesión y sus permisos).
 
-**Respaldo manual.** Si la conexión automática no es posible (el usuario no
-está autorizado en el servicio, es administrador del sitio, o el tema cambia el
-HTML de esa página), el panel muestra un asistente para pegar el token a mano,
-con opción de «Recordar en este navegador» (`localStorage`, persistente).
+**Por qué un clic y no automático.** Obtener el valor del token exige
+**regenerarlo**, y eso invalida el anterior: es una acción destructiva. Hasta la
+v3.0 se disparaba sola al cargar la página, de modo que el tutor sufría el
+cambio sin pedirlo. Desde la v4.0 requiere confirmación explícita, y la pantalla
+avisa de lo que va a pasar.
+
+**Solo el servicio del panel.** El panel únicamente toca la fila de
+`SERVICE_NAME` en *Claves de seguridad*. Si no existe, no hace nada y ofrece la
+conexión manual. La v3.0 tenía un respaldo —«si el tutor solo tiene un token,
+usa ese»— que **regeneraba y se apropiaba de tokens de otros servicios**, en la
+práctica el de la app móvil del propio tutor. Se ha eliminado.
+
+**Dónde se guarda.** En `localStorage` de ese navegador. Es el único
+almacenamiento compartido entre pestañas: con `sessionStorage` cada pestaña
+nueva arrancaría sin token y regeneraría el suyo, invalidando el de las demás.
+La casilla *Guardar solo durante esta sesión* lo devuelve a `sessionStorage` a
+cambio de tener que reconectar (y regenerar) cada día.
+
+**Respaldo manual.** Si la conexión no es posible (el usuario no está autorizado
+en el servicio, es administrador del sitio, o el tema cambia el HTML de esa
+página), el desplegable *Conexión manual* permite pegar el token a mano.
 
 Por qué esto resuelve la vulnerabilidad del token compartido:
 
@@ -126,11 +142,16 @@ tienen `moodle/webservice:createtoken`, y **ningún** rol trae
 
 ### Paso 5 — Primera conexión de cada tutor
 
-Con el paso 3 hecho, **el tutor no tiene que hacer nada**: abre la página del
-panel y se conecta solo (el panel obtiene su token usando su sesión). Solo si
-la conexión automática falla verá el asistente de respaldo para pegar el token
-a mano. El botón 🔑 de la cabecera permite reconectar, cambiar o borrar el
-token en cualquier momento.
+Con el paso 3 hecho, el tutor abre la página del panel y pulsa **«Conectar con
+mi cuenta»** una sola vez. A partir de ahí el panel carga solo en cada visita.
+Si la conexión falla, el desplegable *Conexión manual* permite pegar el token.
+El botón 🔑 de la cabecera permite reconectar, cambiar o borrar el token en
+cualquier momento.
+
+> El alumnado no ve nada de esto: antes de mostrar la pantalla de conexión, el
+> panel comprueba que quien la abre puede ver los registros del curso
+> (`report/log:view`, un permiso de profesorado). Es una salvaguarda por si la
+> Página deja de estar oculta por un descuido.
 
 > Nota para el administrador: la conexión automática **no funciona para cuentas
 > de administrador del sitio** (Moodle no auto-genera tokens de usuario para
@@ -151,10 +172,13 @@ con esa opción activada.
 | Mensaje | Causa | Solución |
 |---------|-------|----------|
 | «El servicio Web no está disponible» | Servicios web o REST deshabilitados | Paso 1 |
-| El panel vuelve a pedir el token | Token caducado o revocado (el panel lo borra solo) | El tutor genera otro en Claves de seguridad (paso 5) |
+| El panel vuelve a pedir el token | Token caducado o revocado (el panel lo borra solo) | Pulsar «Conectar con mi cuenta» |
+| «No hay ningún token del servicio…» | El tutor no está autorizado en el servicio, o es administrador del sitio | Paso 3, o usar una cuenta de profesor |
 | El servicio no aparece en Claves de seguridad | Tutor sin `moodle/webservice:createtoken`, o no autorizado en el servicio | Paso 3 |
 | «Excepción de control de acceso» (`accessexception`) | Función no añadida al servicio, o tutor sin `webservice/rest:use`, o no autorizado | Pasos 2 y 3 |
 | «No tiene permiso…» en una función concreta | Al tutor le falta esa capacidad en el curso (p. ej. ver finalización) | Revisar su rol en el curso |
+| «Tu cuenta no tiene permiso para ver los registros» | Falta `report/log:view` en el curso (es lo que ve el alumnado) | Revisar su rol; si es tutor, usar el enlace «continúa de todos modos» |
+| El tiempo aparece con aviso de «estimación sin verificar» | El formato de fecha del informe de registros es ambiguo en ese sitio | Ver *Tiempos de conexión* más abajo |
 
 ## Comprobaciones incluidas en la PoC
 
@@ -182,29 +206,81 @@ Resuelto respecto a la versión anterior:
 - ❌ ~~Escalada: un token con acceso a todos los cursos del usuario de
   servicio~~ → cada token vale exactamente lo que su dueño ya puede ver.
 
+Corregido en la v4.0 (defectos reales encontrados al revisar la v3.0):
+
+- ❌ ~~El panel podía **regenerar y apropiarse del token de otro servicio**~~
+  (el de la app móvil del tutor, dejándosela rota) cuando no encontraba el de
+  FUNDAE y solo había uno. Ahora exige coincidencia con `SERVICE_NAME`.
+- ❌ ~~La regeneración se disparaba **sola al cargar la página**~~: un cambio de
+  estado irreversible sin intervención del usuario. Ahora requiere un clic.
+- ❌ ~~Los CSV eran **inyectables por fórmula**~~: un alumno llamado
+  `=HYPERLINK(...)` ejecutaba código al abrir la evidencia en Excel. Ahora las
+  celdas peligrosas se neutralizan con un apóstrofo.
+- ❌ ~~Hasta **300 peticiones simultáneas**~~ contra el propio Moodle (100 de
+  ellas descargas completas de registros). Ahora hay un pool de 5 en vuelo.
+- ❌ ~~Cualquiera que abriera la Página veía la pantalla de conexión~~. Ahora se
+  comprueba `report/log:view` antes.
+
 Riesgos residuales (asumidos y documentados):
 
 - **El almacenamiento del navegador es legible por JavaScript de la misma
   página**: un XSS en Moodle podría leer el token del tutor — pero ese mismo
   XSS podría igualmente secuestrar su sesión, así que el token no amplía la
-  superficie de ataque. El modo por defecto (`sessionStorage`, borrado al
-  cerrar el navegador) reduce además la ventana de exposición. Una cookie
-  creada por JavaScript no mejoraría nada (también es legible por XSS) y
-  empeoraría la exposición al viajar en todas las peticiones al dominio; la
-  única cookie segura (`HttpOnly`) requiere componente de servidor.
+  superficie de ataque. Una cookie creada por JavaScript no mejoraría nada
+  (también es legible por XSS) y empeoraría la exposición al viajar en todas
+  las peticiones al dominio; la única cookie segura (`HttpOnly`) requiere
+  componente de servidor.
+- **`localStorage` frente a `sessionStorage`**: desde la v4.0 el modo por
+  defecto es `localStorage`. Es un cambio deliberado: `sessionStorage` es por
+  pestaña, así que cada pestaña nueva regeneraba su propio token e invalidaba
+  el de las demás. La ventana de exposición es mayor, pero el modelo de
+  amenazas no cambia (un XSS lee ambos) y desaparece la rotación constante. La
+  casilla *Guardar solo durante esta sesión* mantiene el comportamiento
+  anterior para quien lo prefiera.
 - **El token viaja en cada petición**: imprescindible servir Moodle por HTTPS.
 - El tutor puede ver su propio token (es suyo): el daño máximo de un descuido
   es equivalente a dejar su sesión abierta. Mitigaciones del admin: fecha de
   caducidad y restricción por IP al gestionar tokens, y revocación inmediata
   desde *Administrar tokens*.
-- **La conexión automática regenera (rotación) el token del servicio FUNDAE**
-  al obtenerlo. Como ese servicio es de uso exclusivo del panel, la rotación no
-  afecta a nada más; si el mismo tutor usara ese token en otra herramienta,
-  dejaría de valer (debería usar un servicio distinto para ello).
+- **Conectar regenera (rota) el token del servicio FUNDAE.** Como ese servicio
+  es de uso exclusivo del panel, la rotación no afecta a nada más; si el mismo
+  tutor usara ese token en otra herramienta, dejaría de valer (debería usar un
+  servicio distinto para ello).
 - Es **ofuscación imposible**: cualquier intento de «esconder» un token
   compartido en el frontend (trocearlo, cifrarlo en cliente, cargarlo de otro
   archivo) es pseudoseguridad — lo que el navegador puede leer, el usuario
   puede leerlo. Por eso la solución es que no haya secreto compartido.
+- **La eliminación total del secreto en cliente requiere sacar el panel de
+  Moodle.** Es el siguiente paso previsto: ver *Camino a producción* en
+  [`DOCUMENTACION.md`](DOCUMENTACION.md).
+
+## Protección de datos (RGPD)
+
+El panel trata **datos personales**: nombre y apellidos, correo electrónico,
+última conexión y **patrón horario de conexión** de cada persona matriculada.
+El patrón horario es dato de comportamiento y merece el mismo cuidado que una
+calificación.
+
+Qué implica en la práctica:
+
+- **Base legal y finalidad.** El tratamiento se ampara en la obligación de
+  acreditar la formación bonificada ante FUNDAE. No uses estos datos ni los
+  CSV que genera el panel para otra finalidad (marketing, evaluación del
+  desempeño del profesorado, etc.).
+- **Minimización.** El panel no envía nada a terceros: todas las peticiones van
+  al propio Moodle y todo el cálculo ocurre en el navegador del tutor. Los CSV
+  se generan en local y no se suben a ningún sitio.
+- **El punto débil es el CSV.** Una vez descargado sale del control de Moodle.
+  Guárdalo en el repositorio documental de la entidad, con control de acceso, y
+  bórralo del equipo del tutor cuando deje de hacer falta. El panel muestra un
+  aviso antes de cada descarga.
+- **Conservación.** Conserva las evidencias el plazo que exija la normativa de
+  la acción formativa, y no más.
+- **Encargado del tratamiento.** Si Ojulab opera el Moodle de un cliente, hace
+  falta el contrato de encargo del artículo 28 del RGPD.
+- **Acceso.** La visibilidad la controla Moodle: recurso *Página* oculto más la
+  comprobación de `report/log:view` que hace el propio panel. Revisa
+  periódicamente quién tiene rol de profesor en el curso.
 
 ## Alternativas evaluadas (verificadas contra el código de Moodle 4.5)
 
@@ -242,8 +318,8 @@ Método de cálculo (el mismo que usan los bloques de "dedicación"):
 1. Se descargan los eventos del alumno en el curso, ordenados por hora.
 2. Se agrupan en **sesiones**: si entre dos eventos consecutivos pasan más de
    `SESSION_GAP_MIN` minutos de inactividad, se cierra la sesión y empieza otra.
-3. Duración de cada sesión = último evento − primer evento. El tiempo total es
-   la suma de sesiones.
+3. Duración de cada sesión = último evento − primer evento **+
+   `SESSION_MIN_SEC`**. El tiempo total es la suma de sesiones.
 4. Las sesiones se agrupan también **por día natural**: en la tabla, pulsar
    sobre el tiempo de un alumno despliega su desglose diario (día, nº de
    sesiones, tiempo), y el botón **«CSV por días»** exporta una fila por
@@ -253,9 +329,28 @@ Método de cálculo (el mismo que usan los bloques de "dedicación"):
 minutos**, el valor habitual en este tipo de cálculo). Un umbral muy bajo
 (p. ej. 1 minuto) corta la sesión en cada lectura de contenido —ver una página
 no genera eventos— y produce tiempos irrealmente bajos; uno muy alto infla las
-sesiones con tiempo de ausencia. Es una **estimación**: el detalle por evento
-exportable (la evidencia bruta para una inspección) sigue siendo el informe
-*Registros* al que enlaza el panel.
+sesiones con tiempo de ausencia.
+
+`SESSION_MIN_SEC` (por defecto **60 s**) es el tiempo que se atribuye a una
+sesión con un solo evento registrado. Sin él, la resta «último menos primero»
+daba **cero** para esas sesiones e infravaloraba de forma sistemática las horas
+acreditadas. Sigue siendo una **estimación**: el detalle por evento exportable
+(la evidencia bruta para una inspección) es el informe *Registros* al que
+enlaza el panel.
+
+### Cuándo el panel avisa de que la estimación no está verificada
+
+El informe de registros de Moodle devuelve la fecha **ya formateada en el
+idioma del sitio**, no como marca de tiempo. En español es `d/m/aa`; en inglés,
+`m/d/aa`. Confundirlos intercambia día y mes en silencio y produce tiempos
+plausibles pero falsos.
+
+El panel resuelve el orden mirando **todos los registros del curso a la vez**:
+en cuanto un valor supera 12 en una de las dos posiciones, esa posición queda
+fijada como el día. Si ningún valor lo desambigua (cursos muy cortos, todo en
+los primeros doce días del mes), asume `d/m` pero **marca el tiempo como
+estimación sin verificar** y lo dice en la tabla y en la checklist. Preferimos
+declarar la duda a publicar horas que parecen buenas y no lo son.
 
 Notas:
 
@@ -263,7 +358,8 @@ Notas:
   no tiene `report/log:view` en el curso, o el formato de descarga JSON está
   deshabilitado (Administración del sitio → Extensiones → Formatos de datos).
 - En cursos con mucho historial la descarga de logs por alumno puede tardar
-  unos segundos; la PoC consulta hasta `MAX_ALUMNOS` (100) alumnos.
+  unos segundos; la PoC consulta hasta `MAX_ALUMNOS` (100) alumnos, con
+  `CONCURRENCY` (5) peticiones en vuelo y una barra de progreso.
 
 ## Informes nativos enlazados desde el panel
 
@@ -275,3 +371,58 @@ Notas:
 
 El panel automatiza la foto de estado y deja a un clic la descarga de la
 evidencia documental desde los informes oficiales de Moodle.
+
+## Desarrollo
+
+`panel-fundae.html` es la **única fuente de verdad**: se pega tal cual en
+Moodle, sin paso de compilación. Las pruebas extraen el `<script>` del propio
+HTML y lo evalúan en un contexto aislado (`test/harness.js`), así que no hay
+copias que puedan desincronizarse.
+
+```bash
+npm install
+npm run lint     # ESLint sobre el panel extraído, las pruebas y los scripts
+npm test         # pruebas unitarias de las funciones de cálculo
+npm run check    # ambas
+```
+
+Las pruebas cubren lo que es determinista y donde se concentran los errores de
+cálculo: reconstrucción de sesiones, agrupación por día, detección del formato
+de fecha, neutralización de fórmulas en CSV, escapado HTML, pool de
+concurrencia, política de reintentos, detección de rol de alumnado y —la
+regresión más importante— que el panel **no toque tokens de otros servicios**.
+
+Lo que las pruebas no pueden cubrir (hace falta un Moodle real) está en el
+guion de verificación manual de la sección siguiente.
+
+### Guion de verificación manual
+
+Con un Moodle de pruebas y el servicio configurado según los pasos 1–3:
+
+1. **Tutor sin token del servicio, con un token de otro servicio presente**
+   (p. ej. el de Moodle Mobile): al pulsar «Conectar» el panel debe decir que
+   no encuentra el servicio, y ese otro token debe seguir **intacto** en
+   *Claves de seguridad*.
+2. **Dos pestañas** con el panel abierto: ambas funcionan y no se invalidan
+   entre ellas.
+3. **Revocar el token** desde *Administrar tokens* y recargar: el panel lo
+   detecta, lo borra del navegador y ofrece reconectar.
+4. **Curso con ~50 alumnos**: en las herramientas de red del navegador nunca
+   debe haber más de 5 peticiones en vuelo, y la barra de progreso avanza.
+5. **Matricular un usuario llamado `=1+1`** y exportar el CSV: la celda debe
+   verse literal en Excel, no evaluada.
+6. **Entrar como estudiante** en una Página visible: mensaje neutro, sin
+   llamadas a la API ni generación de token.
+7. **Cambiar el idioma del sitio a inglés** y comparar la columna de tiempo con
+   el informe *Registros*: o coincide, o el panel declara la estimación como no
+   verificada.
+
+## Estructura del repositorio
+
+```
+panel-fundae.html           el panel (esto es lo que se pega en Moodle)
+versions/                   versiones anteriores, congeladas — ver su README
+test/                       pruebas unitarias + arnés de carga
+scripts/extract-inline.mjs  extrae el <script> del HTML para poder lintarlo
+scripts/purgar-historial.sh limpieza del ZIP que quedó en el historial de git
+```

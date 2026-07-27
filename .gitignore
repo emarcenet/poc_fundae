@@ -7,5 +7,16 @@ desktop.ini
 .vscode/
 .idea/
 
-# Datos exportados por el panel durante pruebas
+# Datos exportados por el panel durante pruebas (contienen datos personales)
 *.csv
+
+# Nunca en el repositorio: paquetes de contenido de curso (SCORM, backups).
+# Son pesados, suelen ser material de un cliente, y quedan para siempre en el
+# historial aunque después se borren.
+*.zip
+*.mbz
+
+# Herramientas
+node_modules/
+.lint/
+coverage/
