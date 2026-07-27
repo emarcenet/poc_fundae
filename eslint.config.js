@@ -29,6 +29,21 @@ export default [
     }
   },
 
+  // Diagnóstico que se pega en la consola del navegador del tutor.
+  {
+    files: ['scripts/diagnostico-navegador.js'],
+    languageOptions: {
+      ecmaVersion: 2020,
+      sourceType: 'script',
+      globals: { ...globals.browser, M: 'readonly' }
+    },
+    rules: {
+      ...js.configs.recommended.rules,
+      'no-unused-vars': ['error', { caughtErrors: 'none' }],
+      'no-empty': ['error', { allowEmptyCatch: true }]
+    }
+  },
+
   // Herramientas y pruebas: aquí sí usamos JS moderno.
   {
     files: ['test/**/*.js', 'scripts/**/*.mjs', 'eslint.config.js'],
