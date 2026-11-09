@@ -2,16 +2,23 @@
 
 <script>
 /* ============================================================
- * PoC panel FUNDAE — Moodle 4.5 / 5, sin plugins. REST con token.
+ * PoC panel FUNDAE v3.1 — Moodle 4.5 / 5.x y Open LMS 5.1, sin plugins.
+ * REST con el token personal del tutor.
  * Funciones necesarias en el servicio externo (ver README):
  *   core_course_get_courses_by_field, core_course_get_contents,
  *   core_enrol_get_enrolled_users, core_completion_get_course_completion_status,
  *   gradereport_user_get_grade_items,
- *   core_completion_get_activities_completion_status (opcional: % progreso)
+ *   core_completion_get_activities_completion_status (% progreso y contenidos vistos)
+ * Nuevas en v3.1 para el informe de seguimiento (si faltan, su columna muestra n/d):
+ *   core_message_get_conversations, core_message_get_conversation_messages,
+ *   mod_forum_get_forums_by_courses, mod_forum_get_forum_discussions,
+ *   mod_forum_get_discussion_posts
  *
  * Tiempo de conexión: calculado desde report/log (descarga JSON) con
  * la sesión del tutor que ve la página (permiso report/log:view).
  * Sesión = eventos consecutivos con huecos < SESSION_GAP_MIN minutos.
+ * La duración de cada sesión la decide fundaeDuracionSesion(); el tiempo
+ * acumulado del alumno es la suma de todas sus sesiones.
  *
  * NOTA: todo el CSS y el esqueleto HTML se generan desde JS porque
  * el editor de Moodle elimina las etiquetas <style> al guardar.
@@ -22,10 +29,43 @@
  * defecto (se borra al cerrar) o localStorage si marca «Recordar» — y
  * consulta la API con sus propios permisos: si se filtra, no concede
  * más acceso del que ese tutor ya tiene. */
+var PANEL_VERSION = '3.1.0';
 var TOKEN_KEY = 'fundae_wstoken';
 var SERVICE_NAME = 'FUNDAE PoC'; // nombre del servicio externo en Moodle
 var MAX_ALUMNOS = 100;     // límite de alumnos consultados en la PoC
 var SESSION_GAP_MIN = 30;  // minutos de inactividad que cierran una sesión
+var CONCURRENCIA = 6;      // peticiones simultáneas máximas (no saturar la plataforma)
+var ROLES_TUTOR = ['editingteacher', 'teacher']; // roles que cuentan como tutor en los foros
+// Tipos que nunca cuentan como contenido. Las secciones no son módulos; las
+// subsecciones (5.x), las áreas de texto y los bancos de preguntas (5.x) sí.
+var EXCLUIR_CONTENIDOS = ['label', 'subsection', 'qbank'];
+// true: «Mensajes tutor» = mensajes privados del tutor + respuestas de tutores
+// a mensajes del alumno en los foros. false: solo mensajes privados.
+var CONTAR_RESPUESTAS_FORO = true;
+
+/* ============================================================
+ * DURACIÓN DE UNA SESIÓN · criterio de acreditación (TODO del consultor)
+ * ------------------------------------------------------------
+ * Cada sesión ya llega delimitada por el corte de inactividad
+ * (SESSION_GAP_MIN). Esta función decide cuántos segundos se acreditan
+ * por ella. El tiempo acumulado del alumno es la suma de todas.
+ *
+ *   ses.inicio  → hora del primer evento (segundos epoch)
+ *   ses.fin     → hora del último evento (segundos epoch)
+ *   ses.eventos → número de eventos de la sesión
+ *   ses.huecos  → segundos entre cada par de eventos consecutivos
+ *
+ * Regla actual (conservadora, la de los bloques de «dedicación»):
+ * del primer al último evento. Una sesión de un solo evento suma 0 s,
+ * porque Moodle no registra el tiempo de lectura tras el último clic.
+ * Si cambias la regla, actualiza también DURACION_SESION_DESCRIPCION:
+ * es el texto que ven el tutor y el auditor en el panel.
+ * ============================================================ */
+var DURACION_SESION_DESCRIPCION = 'del primer al último evento de la sesión';
+function fundaeDuracionSesion(ses) {
+  // TODO: sustituir por la regla acordada para FUNDAE.
+  return ses.fin - ses.inicio;
+}
 
 // Por defecto el token vive en sessionStorage (se borra al cerrar el
 // navegador). Solo si el tutor marca «Recordar en este navegador» pasa
@@ -41,7 +81,8 @@ function setToken(t, remember) {
   } catch (e) {}
 }
 
-var fundaeData = { students: [], sortKey: 'name', sortDir: 1, expanded: {}, expandedType: {} };
+var fundaeData = { students: [], sortKey: 'name', sortDir: 1, expanded: {}, expandedType: {},
+  fSortKey: 'name', fSortDir: 1, fExpanded: {}, methodOpen: true };
 
 /* --- Inyección de estilos (el editor de Moodle purga <style>) --- */
 (function () {
@@ -113,6 +154,31 @@ var fundaeData = { students: [], sortKey: 'name', sortDir: 1, expanded: {}, expa
     '#fundae-panel .fp-error{padding:14px 16px;background:#fdecea;border:1px solid #f2b8b5;color:#8c1d18;border-radius:12px;}',
     '#fundae-panel .fp-filter{max-width:230px;margin-left:auto;border-radius:50rem;border:1px solid #dde3ee;padding:4px 14px;font-size:.85em;}',
 
+    // --- Informe de seguimiento FUNDAE (v3.1) ---
+    '#fundae-panel .fp-2l{line-height:1.25;white-space:nowrap;}',
+    '#fundae-panel .fp-2l small{color:#7a8699;font-size:.9em;}',
+    '#fundae-panel a.fp-num-link{font-weight:700;color:#0f6cbf;text-decoration:underline;}',
+    '#fundae-panel .fp-sub-num{display:block;color:#7a8699;font-size:.72em;white-space:nowrap;margin-top:2px;}',
+    '#fundae-panel .fp-pbar{position:relative;height:20px;border-radius:6px;background:#e8eef8;border:1px solid #c9d4e6;min-width:120px;overflow:hidden;}',
+    '#fundae-panel .fp-pbar > i{position:absolute;left:0;top:0;bottom:0;}',
+    '#fundae-panel .fp-pbar > b{position:relative;display:block;text-align:center;font-size:.78em;line-height:18px;color:#1d2b45;}',
+    '#fundae-panel details.fp-method{background:#f4f7fc;border:1px solid #e3e9f4;border-radius:12px;padding:10px 14px;margin-bottom:14px;font-size:.88em;}',
+    '#fundae-panel details.fp-method summary{cursor:pointer;font-weight:600;color:#0f6cbf;}',
+    '#fundae-panel .fp-method dl{margin:10px 0 0;display:grid;grid-template-columns:minmax(150px,max-content) 1fr;gap:6px 14px;}',
+    '#fundae-panel .fp-method dt{font-weight:600;color:#1d2b45;}',
+    '#fundae-panel .fp-method dd{margin:0;color:#43506b;}',
+    '#fundae-panel .fp-det{display:grid;grid-template-columns:1fr 1fr;gap:18px;padding:8px 4px;}',
+    '#fundae-panel .fp-det .fp-det-wide{grid-column:1 / -1;}',
+    '#fundae-panel .fp-det h6{font-weight:700;font-size:.8em;text-transform:uppercase;letter-spacing:.05em;color:#43506b;margin:0 0 8px;}',
+    '#fundae-panel .fp-det table td,#fundae-panel .fp-det table th{padding:5px 8px;font-size:.92em;}',
+    '#fundae-panel .fp-det tfoot td{font-weight:700;border-top:2px solid #e3e9f4;}',
+    '#fundae-panel .fp-zero{color:#a0a9b8;}',
+    '#fundae-panel .fp-cont{list-style:none;padding:0;margin:0;max-height:280px;overflow:auto;}',
+    '#fundae-panel .fp-cont li{padding:4px 0;border-bottom:1px dashed #eef1f6;font-size:.9em;}',
+    '#fundae-panel .fp-yes{color:#1b7e2c;font-weight:700;}',
+    '#fundae-panel .fp-no{color:#b3261e;font-weight:700;}',
+    '@media (max-width:760px){#fundae-panel .fp-det{grid-template-columns:1fr;}#fundae-panel .fp-method dl{grid-template-columns:1fr;}}',
+
     '@media print{#fundae-panel .fp-noprint{display:none !important;}',
     '#fundae-panel .fp-hero{background:#fff !important;color:#000;border:1px solid #ddd;box-shadow:none;}',
     '#fundae-panel .fp-hero h2{color:#000;}',
@@ -134,10 +200,12 @@ var fundaeData = { students: [], sortKey: 'name', sortDir: 1, expanded: {}, expa
     '<button class="btn btn-sm fp-btn-light" onclick="fundaeRun()">⟳ Actualizar</button>' +
     '<button class="btn btn-sm fp-btn-ghost" onclick="fundaeCsv()">⬇ CSV resumen</button>' +
     '<button class="btn btn-sm fp-btn-ghost" onclick="fundaeCsvDays()">⬇ CSV por días</button>' +
+    '<button class="btn btn-sm fp-btn-ghost" onclick="fundaeCsvFundae()">⬇ CSV informe FUNDAE</button>' +
+    '<button class="btn btn-sm fp-btn-ghost" onclick="fundaeCsvSesiones()">⬇ CSV sesiones</button>' +
     '<button class="btn btn-sm fp-btn-ghost" onclick="window.print()">🖨 Imprimir</button>' +
     '<button class="btn btn-sm fp-btn-ghost" onclick="fundaeTokenSetup()" title="Cambiar o borrar el token guardado en este navegador">🔑</button>' +
     '</div></div>' +
-    '<div class="fp-sub">Seguimiento de teleformación bonificada · trazabilidad, evaluación y tutorización</div>' +
+    '<div class="fp-sub">Seguimiento de teleformación bonificada · trazabilidad, evaluación y tutorización · v' + PANEL_VERSION + '</div>' +
     '<div class="fp-chips" id="fp-chips"><span class="fp-chip">Cargando curso…</span></div>' +
     '<div class="fp-sub" id="fp-timestamp"></div>' +
     '</div>' +
@@ -145,6 +213,8 @@ var fundaeData = { students: [], sortKey: 'name', sortDir: 1, expanded: {}, expa
 })();
 
 function fundaeCourseId() {
+  // Moodle 4.x/5.x publica el curso de la página en M.cfg.courseId (siteId = portada).
+  if (M.cfg && M.cfg.courseId && M.cfg.courseId !== M.cfg.siteId) return parseInt(M.cfg.courseId, 10);
   var m = location.pathname.match(/course\/view\.php/) && location.search.match(/[?&]id=(\d+)/);
   if (m) return parseInt(m[1], 10);
   var bc = document.body.className.match(/course-(\d+)/);
@@ -172,9 +242,94 @@ function ws(fn, args) {
   });
 }
 
-/* --- Tiempo de conexión desde report/log (sesión del tutor) --- */
+/* --- Registros del curso por alumno (descarga JSON con la sesión del tutor) --- */
 
-function fundaeLogTimestamps(courseid, userid) {
+// La descarga escribe la hora con el formato «strftimedatetimeshortaccurate»
+// del idioma del tutor (en inglés y en español: %d/%m/%y, %H:%M:%S). Se lee con
+// core_get_string (AJAX con la sesión, sin token) para no confundir día y mes
+// en idiomas con otro orden. Si no se puede, se usa la lectura d/m/a de la v3.0.
+var fundaeDateParser = null;
+
+function fundaeLoadDateFormat() {
+  var url = M.cfg.wwwroot + '/lib/ajax/service.php?sesskey=' + encodeURIComponent(M.cfg.sesskey) +
+    '&info=core_get_string';
+  var body = JSON.stringify([{ index: 0, methodname: 'core_get_string',
+    args: { stringid: 'strftimedatetimeshortaccurate', component: 'langconfig' } }]);
+  return fetch(url, { method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' }, body: body })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      var fmt = (j && j[0] && !j[0].error) ? j[0].data : '';
+      fundaeDateParser = fmt ? fundaeMakeDateParser(String(fmt)) : null;
+    })
+    .catch(function () { fundaeDateParser = null; });
+}
+
+// Convierte un patrón strftime numérico en una función que lee la fecha.
+// Devuelve null si el patrón usa nombres de mes o de día (no son numéricos).
+function fundaeMakeDateParser(fmt) {
+  fmt = fmt.replace(/%T/g, '%H:%M:%S').replace(/%R/g, '%H:%M')
+    .replace(/%D/g, '%m/%d/%y').replace(/%F/g, '%Y-%m-%d');
+  var D2 = '(\\d{1,2})', SD2 = '\\s*(\\d{1,2})', AMPM = '([ap]\\.?\\s?m\\.?)';
+  var map = { d: ['d', D2], e: ['d', SD2], m: ['m', D2], y: ['y', '(\\d{2})'], Y: ['Y', '(\\d{4})'],
+    H: ['H', SD2], k: ['H', SD2], I: ['I', SD2], l: ['I', SD2],
+    M: ['M', '(\\d{2})'], S: ['S', '(\\d{2})'], p: ['p', AMPM], P: ['p', AMPM] };
+  var order = [], re = '', i = 0;
+  while (i < fmt.length) {
+    var ch = fmt.charAt(i);
+    if (ch === '%' && i + 1 < fmt.length) {
+      var t = fmt.charAt(i + 1);
+      if (map[t]) { order.push(map[t][0]); re += map[t][1]; }
+      else if (t === '%') re += '%';
+      else if (t === 'n' || t === 't') re += '\\s*';
+      else return null; // %b, %B, %a… → nombres: no se puede leer como número
+      i += 2;
+    } else if (/\s/.test(ch)) { re += '\\s*'; i++; }
+    else { re += ch.replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&'); i++; }
+  }
+  if (order.indexOf('d') < 0 || order.indexOf('m') < 0) return null;
+  var rx = new RegExp(re, 'i');
+  return function (txt) {
+    var m = rx.exec(String(txt));
+    if (!m) return null;
+    var v = {};
+    order.forEach(function (k, idx) { v[k] = m[idx + 1]; });
+    var y = v.Y ? parseInt(v.Y, 10) : (v.y ? 2000 + parseInt(v.y, 10) : new Date().getFullYear());
+    var h = parseInt(v.H || v.I || '0', 10);
+    if (v.I && v.p) {
+      var pm = /^p/i.test(v.p);
+      if (pm && h < 12) h += 12;
+      if (!pm && h === 12) h = 0;
+    }
+    return new Date(y, parseInt(v.m, 10) - 1, parseInt(v.d, 10), h,
+      parseInt(v.M || '0', 10), parseInt(v.S || '0', 10)).getTime() / 1000;
+  };
+}
+
+// Lectura por defecto (la de la v3.0): «d/m/aa, HH:MM(:SS)».
+function fundaeDefaultDate(txt) {
+  var m = String(txt).match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})\D+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  var y = parseInt(m[3], 10); if (y < 100) y += 2000;
+  return new Date(y, parseInt(m[2], 10) - 1, parseInt(m[1], 10),
+    parseInt(m[4], 10), parseInt(m[5], 10), parseInt(m[6] || '0', 10)).getTime() / 1000;
+}
+
+function fundaeParseDate(txt) {
+  var ts = fundaeDateParser ? fundaeDateParser(txt) : null;
+  return ts !== null ? ts : fundaeDefaultDate(txt);
+}
+
+// Descripciones de evento: Moodle las escribe siempre en inglés (no se
+// traducen), así que se reconocen igual en un sitio en español o en inglés.
+var RX_FORO = /has created the (post|discussion) with id/;   // mensaje o debate creado
+var RX_CHAT = /has sent a message in the chat/;               // mensaje de chat
+
+// Devuelve [{ts, txt}] (hora del evento y texto completo de la fila) o null si
+// el usuario no puede ver los registros. IMPORTANTE: la descarga JSON de Moodle
+// (4.5 y 5.x) es una lista de hojas, [[{fila}, {fila}…]]. La v3.0 recorría el
+// nivel exterior y no llegaba a leer ninguna hora; aquí se aplana antes.
+function fundaeLogRows(courseid, userid) {
   var p = new URLSearchParams({
     chooselog: 1, id: courseid, user: userid, date: 0,
     modid: '', modaction: '', origin: '', edulevel: -1,
@@ -183,37 +338,143 @@ function fundaeLogTimestamps(courseid, userid) {
   return fetch(M.cfg.wwwroot + '/report/log/index.php?' + p.toString(), { credentials: 'same-origin' })
     .then(function (r) { return r.text(); })
     .then(function (txt) {
-      var rows;
-      try { rows = JSON.parse(txt); } catch (e) { return null; } // sin permiso → HTML, no JSON
-      if (!Array.isArray(rows)) return null;
-      var ts = [];
+      var data;
+      try { data = JSON.parse(txt); } catch (e) { return null; } // sin permiso → HTML, no JSON
+      if (!Array.isArray(data)) return null;
+      var rows = (data.length && Array.isArray(data[0])) ? [].concat.apply([], data) : data;
+      var out = [];
       rows.forEach(function (row) {
-        // Primera columna = hora del evento, formato numérico "d/m/yy, HH:MM(:SS)".
-        var v = row[Object.keys(row)[0]];
-        var m = String(v).match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})\D+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-        if (!m) return;
-        var y = parseInt(m[3], 10); if (y < 100) y += 2000;
-        ts.push(new Date(y, parseInt(m[2], 10) - 1, parseInt(m[1], 10),
-          parseInt(m[4], 10), parseInt(m[5], 10), parseInt(m[6] || '0', 10)).getTime() / 1000);
+        if (!row || typeof row !== 'object') return;
+        var vals = Object.keys(row).map(function (k) { return row[k]; });
+        var ts = null;
+        // La hora es la primera columna; si cambiara el orden, se busca en el resto.
+        for (var i = 0; i < vals.length && ts === null; i++) ts = fundaeParseDate(vals[i]);
+        if (ts !== null) out.push({ ts: ts, txt: vals.join(' | ') });
       });
-      return ts;
+      return out;
     })
     .catch(function () { return null; });
 }
 
-// Reconstruye sesiones a partir de timestamps con el umbral de inactividad.
+// Agrupa los eventos en sesiones por inactividad, acredita cada sesión con
+// fundaeDuracionSesion() y lleva el acumulado sesión a sesión.
 function fundaeSessions(ts) {
   if (!ts || !ts.length) return { seconds: 0, sessions: 0, list: [] };
   ts = ts.slice().sort(function (a, b) { return a - b; });
   var gap = SESSION_GAP_MIN * 60;
-  var list = [], start = ts[0], prev = ts[0];
+  var groups = [], cur = [ts[0]];
   for (var i = 1; i < ts.length; i++) {
-    if (ts[i] - prev > gap) { list.push({ start: start, end: prev, seconds: prev - start }); start = ts[i]; }
-    prev = ts[i];
+    if (ts[i] - ts[i - 1] > gap) { groups.push(cur); cur = []; }
+    cur.push(ts[i]);
   }
-  list.push({ start: start, end: prev, seconds: prev - start });
-  var total = list.reduce(function (a, sn) { return a + sn.seconds; }, 0);
-  return { seconds: total, sessions: list.length, list: list };
+  groups.push(cur);
+  var acum = 0;
+  var list = groups.map(function (g, idx) {
+    var huecos = [];
+    for (var j = 1; j < g.length; j++) huecos.push(g[j] - g[j - 1]);
+    var ses = { inicio: g[0], fin: g[g.length - 1], eventos: g.length, huecos: huecos };
+    var sec;
+    try { sec = Number(fundaeDuracionSesion(ses)); } catch (e) { sec = NaN; }
+    if (!isFinite(sec)) {
+      if (window.console) console.warn('fundaeDuracionSesion() no ha devuelto un número; se usa fin − inicio.');
+      sec = ses.fin - ses.inicio;
+    }
+    sec = Math.max(0, Math.round(sec));
+    acum += sec;
+    return { n: idx + 1, start: ses.inicio, end: ses.fin, events: ses.eventos, seconds: sec, acumulado: acum };
+  });
+  return { seconds: acum, sessions: list.length, list: list };
+}
+
+// Ejecuta tareas con un máximo de peticiones simultáneas.
+function fundaePool(items, limit, worker) {
+  var results = new Array(items.length), next = 0;
+  function run() {
+    if (next >= items.length) return Promise.resolve();
+    var i = next++;
+    return Promise.resolve()
+      .then(function () { return worker(items[i], i); })
+      .then(function (r) { results[i] = r; }, function () { results[i] = null; })
+      .then(run);
+  }
+  var runners = [];
+  for (var k = 0; k < Math.min(limit, items.length); k++) runners.push(run());
+  return Promise.all(runners).then(function () { return results; });
+}
+
+/* --- Mensajes del tutor y foros (API REST con el token del tutor) --- */
+
+// Mensajes privados que el tutor conectado ha enviado a cada alumno. Los
+// mensajes de Moodle no pertenecen a un curso: se acotan a las fechas del
+// curso. Devuelve {uid: n} o null si faltan las funciones de mensajería.
+function fundaeTutorMessages(course, studentIds) {
+  var me = M.cfg.userId;
+  if (!me) return Promise.resolve(null);
+  var desde = course.startdate || 0;
+  var hasta = course.enddate ? course.enddate + 86400 : Infinity; // incluye el último día
+  var isStu = {};
+  studentIds.forEach(function (id) { isStu[id] = true; });
+  return ws('core_message_get_conversations', { userid: me, type: 1, limitfrom: 0, limitnum: 0 })
+    .then(function (r) {
+      var convs = (r.conversations || []).filter(function (cv) {
+        return (cv.members || []).some(function (mb) { return isStu[mb.id]; });
+      });
+      return fundaePool(convs, CONCURRENCIA, function (cv) {
+        var other = (cv.members || []).filter(function (mb) { return isStu[mb.id]; })[0];
+        return ws('core_message_get_conversation_messages',
+          { currentuserid: me, convid: cv.id, timefrom: desde, limitfrom: 0, limitnum: 0 })
+          .then(function (res) {
+            var n = (res.messages || []).filter(function (msg) {
+              return msg.useridfrom === me && msg.timecreated >= desde && msg.timecreated <= hasta;
+            }).length;
+            return { uid: other.id, n: n };
+          });
+      });
+    })
+    .then(function (list) {
+      var out = {};
+      studentIds.forEach(function (id) { out[id] = 0; });
+      list.forEach(function (x) { if (x) out[x.uid] = (out[x.uid] || 0) + x.n; });
+      return out;
+    })
+    .catch(function () { return null; });
+}
+
+// Recorre los foros del curso y cuenta, por alumno, sus mensajes publicados
+// y las respuestas que los tutores han dado a esos mensajes (incluidas las
+// respuestas privadas). Devuelve {posts, tutorReplies} o null si faltan funciones.
+function fundaeForumData(courseid, isStudent, isTutor) {
+  return ws('mod_forum_get_forums_by_courses', { 'courseids[0]': courseid })
+    .then(function (forums) {
+      return fundaePool(forums || [], CONCURRENCIA, function (f) {
+        return ws('mod_forum_get_forum_discussions', { forumid: f.id })
+          .then(function (r) { return (r.discussions || []).map(function (d) { return d.discussion; }); });
+      });
+    })
+    .then(function (lists) {
+      var dids = [].concat.apply([], lists.filter(Boolean));
+      return fundaePool(dids, CONCURRENCIA, function (did) {
+        return ws('mod_forum_get_discussion_posts', { discussionid: did, sortby: 'created', sortdirection: 'ASC' })
+          .then(function (r) { return r.posts || []; });
+      });
+    })
+    .then(function (postLists) {
+      var posts = {}, replies = {};
+      postLists.forEach(function (pl) {
+        if (!pl) return;
+        var authorOf = {};
+        pl.forEach(function (p) { authorOf[p.id] = p.author ? p.author.id : null; });
+        pl.forEach(function (p) {
+          if (p.isdeleted) return;
+          var a = p.author ? p.author.id : null;
+          if (isStudent(a)) posts[a] = (posts[a] || 0) + 1;
+          var pa = p.parentid ? authorOf[p.parentid] : null;
+          if (pa && isTutor(a) && isStudent(pa)) replies[pa] = (replies[pa] || 0) + 1;
+        });
+      });
+      return { posts: posts, tutorReplies: replies };
+    })
+    .catch(function () { return null; });
 }
 
 // Agrupa las sesiones por día natural (clave aaaa-mm-dd, por fecha de inicio).
@@ -241,6 +502,31 @@ function fmtDur(sec) {
   var h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
   return h + 'h ' + (m < 10 ? '0' : '') + m + 'm';
 }
+// Formatos del informe de seguimiento (v3.1): fechas dd/mm/aaaa y duraciones con segundos.
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+function fmtD(ts) {
+  if (!ts) return '—';
+  var d = new Date(ts * 1000);
+  return pad2(d.getDate()) + '/' + pad2(d.getMonth() + 1) + '/' + d.getFullYear();
+}
+function fmtT(ts, secs) {
+  if (!ts) return '—';
+  var d = new Date(ts * 1000);
+  return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + (secs ? ':' + pad2(d.getSeconds()) : '');
+}
+function fmtDT(ts) { return ts ? fmtD(ts) + ' ' + fmtT(ts) : ''; }
+function fmtDurS(sec) { // «1h 14m 20s»
+  if (sec == null) return 'n/d';
+  sec = Math.round(sec);
+  var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return (h ? h + 'h ' : '') + (h || m ? m + 'm ' : '') + s + 's';
+}
+function fmtHMS(sec) { // «1:14:20» (las horas pueden pasar de 24)
+  if (sec == null) return '';
+  sec = Math.round(sec);
+  return Math.floor(sec / 3600) + ':' + pad2(Math.floor((sec % 3600) / 60)) + ':' + pad2(sec % 60);
+}
+function fmtPct(p) { return (Math.round(p * 10) / 10).toLocaleString('es-ES'); }
 function avatar(name) {
   var colors = ['#0f6cbf', '#5b3fc5', '#188070', '#b3550e', '#a02b56', '#356ac0', '#6a4f9e'];
   var h = 0;
@@ -258,7 +544,7 @@ function fundaeRun() {
   if (!getToken()) { fundaeConnect(); return; }
   out.innerHTML = '<div class="card fp-card"><div class="card-body" style="text-align:center;padding:48px 20px;">' +
     '<div class="spinner-border text-primary" role="status" style="margin-bottom:10px;"></div>' +
-    '<div class="fp-muted">Consultando API y registros del curso…</div></div></div>';
+    '<div class="fp-muted" id="fp-progress">Consultando API y registros del curso…</div></div></div>';
 
   var course, contents, grades, rawStudents;
 
@@ -269,27 +555,43 @@ function fundaeRun() {
       return Promise.all([
         ws('core_enrol_get_enrolled_users', { courseid: courseid }),
         ws('core_course_get_contents', { courseid: courseid }),
-        ws('gradereport_user_get_grade_items', { courseid: courseid })
+        ws('gradereport_user_get_grade_items', { courseid: courseid }),
+        fundaeLoadDateFormat()
       ]);
     })
     .then(function (rs) {
       contents = rs[1]; grades = rs[2];
-      rawStudents = rs[0].filter(function (u) {
-        return (u.roles || []).some(function (r) { return r.shortname === 'student'; });
-      });
+      var enrolled = rs[0] || [];
+      function hasRole(u, names) {
+        return (u.roles || []).some(function (r) { return names.indexOf(r.shortname) >= 0; });
+      }
+      rawStudents = enrolled.filter(function (u) { return hasRole(u, ['student']); });
+      var stuIds = {}, tutIds = {};
+      rawStudents.forEach(function (u) { stuIds[u.id] = true; });
+      enrolled.forEach(function (u) { if (hasRole(u, ROLES_TUTOR)) tutIds[u.id] = true; });
+      if (M.cfg.userId) tutIds[M.cfg.userId] = true; // el tutor conectado, sea cual sea su rol
       var sample = rawStudents.slice(0, MAX_ALUMNOS);
-      return Promise.all(sample.map(function (u) {
+      var done = 0;
+      var pStudents = fundaePool(sample, CONCURRENCIA, function (u) {
         var pCourse = ws('core_completion_get_course_completion_status', { courseid: courseid, userid: u.id })
           .then(function (r) { return r.completionstatus; }).catch(function () { return null; });
         var pActs = ws('core_completion_get_activities_completion_status', { courseid: courseid, userid: u.id })
           .then(function (r) { return r.statuses || []; }).catch(function () { return null; });
-        var pLogs = fundaeLogTimestamps(courseid, u.id);
+        var pLogs = fundaeLogRows(courseid, u.id);
         return Promise.all([pCourse, pActs, pLogs]).then(function (pr) {
-          return { user: u, completion: pr[0], actstatuses: pr[1], logts: pr[2] };
+          done++;
+          fundaeProgress('Consultando registros de los alumnos… ' + done + '/' + sample.length);
+          return { user: u, completion: pr[0], actstatuses: pr[1], logrows: pr[2] };
         });
-      }));
+      });
+      var pMsgs = fundaeTutorMessages(course, rawStudents.map(function (u) { return u.id; }));
+      var pForum = fundaeForumData(courseid,
+        function (id) { return !!stuIds[id]; }, function (id) { return !!tutIds[id]; });
+      return Promise.all([pStudents, pMsgs, pForum]);
     })
-    .then(function (perStudent) { fundaeBuild(course, rawStudents, perStudent, contents, grades); })
+    .then(function (all) {
+      fundaeBuild(course, rawStudents, all[0].filter(Boolean), contents, grades, { msgs: all[1], forum: all[2] });
+    })
     .catch(function (e) {
       if (e.errorcode === 'invalidtoken') {
         // Token caducado o revocado: se borra del navegador y se pide de nuevo.
@@ -305,14 +607,44 @@ function fundaeRun() {
     });
 }
 
-function fundaeBuild(course, rawStudents, perStudent, contents, grades) {
+// Contenidos con finalización por vista (criterio acordado): actividades cuya
+// finalización exige verlas (archivos, libros, lecciones, SCORM…). Quedan fuera
+// secciones, subsecciones y áreas de texto. «Visto» = la regla «ver» cumplida.
+var NOMBRE_TIPO = { resource: 'Archivo', book: 'Libro', lesson: 'Lección', scorm: 'SCORM', page: 'Página',
+  url: 'URL', folder: 'Carpeta', imscp: 'Paquete IMS', h5pactivity: 'H5P', hvp: 'H5P', quiz: 'Cuestionario',
+  assign: 'Tarea', forum: 'Foro', glossary: 'Glosario', wiki: 'Wiki', data: 'Base de datos',
+  feedback: 'Encuesta', choice: 'Consulta', lti: 'Herramienta externa', workshop: 'Taller', chat: 'Chat',
+  bigbluebuttonbn: 'BigBlueButton', survey: 'Encuesta predefinida' };
+
+function fundaeContents(statuses, modById) {
+  if (!statuses) return null; // falta core_completion_get_activities_completion_status
+  var list = [];
+  statuses.forEach(function (s) {
+    if (EXCLUIR_CONTENIDOS.indexOf(s.modname) >= 0) return;
+    var rule = (s.details || []).filter(function (d) { return d.rulename === 'completionview'; })[0];
+    if (!rule) return; // su finalización no exige verlo
+    var mod = modById[s.cmid] || {};
+    list.push({ cmid: s.cmid, name: mod.name || ('#' + s.cmid), type: NOMBRE_TIPO[s.modname] || s.modname,
+      seen: !!(rule.rulevalue && rule.rulevalue.status > 0) });
+  });
+  var seen = list.filter(function (c) { return c.seen; }).length;
+  return { total: list.length, seen: seen, pct: list.length ? seen * 100 / list.length : null, list: list };
+}
+
+function fundaeBuild(course, rawStudents, perStudent, contents, grades, extras) {
   var now = Math.floor(Date.now() / 1000);
+  extras = extras || {};
 
   var finalGrades = {};
   ((grades && grades.usergrades) || []).forEach(function (ug) {
     var gi = (ug.gradeitems || []).filter(function (g) { return g.itemtype === 'course'; })[0];
     finalGrades[ug.userid] = gi ? gi.gradeformatted : null;
   });
+
+  var mods = [];
+  (contents || []).forEach(function (sec) { (sec.modules || []).forEach(function (m) { mods.push(m); }); });
+  var modById = {};
+  mods.forEach(function (m) { modById[m.id] = m; });
 
   var students = perStudent.map(function (ps) {
     var u = ps.user;
@@ -322,7 +654,20 @@ function fundaeBuild(course, rawStudents, perStudent, contents, grades) {
       var done = ps.actstatuses.filter(function (s) { return s.state === 1 || s.state === 2; }).length;
       pct = Math.round(done * 100 / ps.actstatuses.length);
     }
-    var ses = ps.logts === null ? null : fundaeSessions(ps.logts);
+    var rows = ps.logrows; // null = el tutor no puede ver los registros
+    var ses = rows === null ? null : fundaeSessions(rows.map(function (x) { return x.ts; }));
+    var firstLog = null, lastLog = null;
+    (rows || []).forEach(function (x) {
+      if (firstLog === null || x.ts < firstLog) firstLog = x.ts;
+      if (lastLog === null || x.ts > lastLog) lastLog = x.ts;
+    });
+    var foroLog = rows === null ? null : rows.filter(function (x) { return RX_FORO.test(x.txt); }).length;
+    var chats = rows === null ? null : rows.filter(function (x) { return RX_CHAT.test(x.txt); }).length;
+    var priv = extras.msgs ? (extras.msgs[u.id] || 0) : null;
+    var foroTut = extras.forum ? (extras.forum.tutorReplies[u.id] || 0) : null;
+    var tutTotal = null;
+    if (priv !== null || (CONTAR_RESPUESTAS_FORO && foroTut !== null))
+      tutTotal = (priv || 0) + (CONTAR_RESPUESTAS_FORO ? (foroTut || 0) : 0);
     return {
       uid: u.id,
       name: u.fullname,
@@ -334,12 +679,20 @@ function fundaeBuild(course, rawStudents, perStudent, contents, grades) {
       sessions: ses === null ? null : ses.sessions,
       byDay: ses === null ? null : fundaeByDay(ses.list),
       completed: ps.completion ? !!ps.completion.completed : null,
-      grade: finalGrades[u.id] || null
+      grade: finalGrades[u.id] || null,
+      // --- Informe de seguimiento FUNDAE (v3.1) ---
+      first: firstLog,
+      lastCourse: u.lastcourseaccess || lastLog || null,
+      sesList: ses === null ? null : ses.list,
+      cont: fundaeContents(ps.actstatuses, modById),
+      tutPriv: priv,
+      tutForo: foroTut,
+      tutTotal: tutTotal,
+      foroPosts: extras.forum ? (extras.forum.posts[u.id] || 0) : foroLog,
+      foroSrc: extras.forum ? 'api' : (foroLog === null ? null : 'log'),
+      chats: chats
     };
   });
-
-  var mods = [];
-  (contents || []).forEach(function (sec) { (sec.modules || []).forEach(function (m) { mods.push(m); }); });
   var nEval = mods.filter(function (m) { return m.modname === 'quiz' || m.modname === 'assign'; }).length;
   var hasForum = mods.some(function (m) { return ['forum', 'chat', 'bigbluebuttonbn'].indexOf(m.modname) >= 0; });
 
@@ -385,6 +738,10 @@ function fundaeBuild(course, rawStudents, perStudent, contents, grades) {
   var nOver75 = students.filter(function (s) { return s.pct !== null && s.pct >= 75; }).length;
   var timeTracking = students.some(function (s) { return s.time !== null; });
   var totalTime = students.reduce(function (acc, s) { return acc + (s.time || 0); }, 0);
+  var contRef = students.filter(function (s) { return s.cont; })[0];
+  var contTotal = contRef ? contRef.cont.total : null;
+  var tutData = students.some(function (s) { return s.tutTotal !== null; });
+  var nTutContact = students.filter(function (s) { return s.tutTotal > 0; }).length;
 
   fundaeData.course = course;
   fundaeData.students = students;
@@ -396,7 +753,8 @@ function fundaeBuild(course, rawStudents, perStudent, contents, grades) {
     pctTracking: pctTracking, nOver75: nOver75, nAcc: nAcc, nDone: nDone,
     timeTracking: timeTracking, totalTime: totalTime,
     nScorm: scorm.items.length, scormGraded: scorm.nGraded,
-    nGradableActs: nGradableActs, nGradedActs: nGradedActs
+    nGradableActs: nGradableActs, nGradedActs: nGradedActs,
+    contTotal: contTotal, tutData: tutData, nTutContact: nTutContact
   };
   fundaeRender();
 }
@@ -458,7 +816,14 @@ function fundaeRender() {
     ['Calificaciones registradas', s.anyGraded, s.anyGraded ? 'Hay notas en el libro de calificaciones' : 'Sin calificaciones todavía'],
     ['Alumnos con progreso ≥ 75 % de actividades', !s.pctTracking ? 'warn' : (s.nOver75 === s.nStudents ? true : (s.nOver75 > 0 ? 'warn' : false)),
       s.pctTracking ? s.nOver75 + '/' + s.nStudents + ' alumnos' : 'Añadir core_completion_get_activities_completion_status al servicio para medirlo'],
-    ['Alumnos con curso completado', s.pctDone === 100 ? true : (s.pctDone > 0 ? 'warn' : false), s.pctDone + '% (' + s.nDone + '/' + s.nStudents + ')']
+    ['Alumnos con curso completado', s.pctDone === 100 ? true : (s.pctDone > 0 ? 'warn' : false), s.pctDone + '% (' + s.nDone + '/' + s.nStudents + ')'],
+    ['Contenidos con finalización por vista', s.contTotal > 0 ? true : 'warn',
+      s.contTotal === null ? 'Añadir core_completion_get_activities_completion_status al servicio para medirlo'
+        : (s.contTotal > 0 ? s.contTotal + ' contenidos (archivos, libros, lecciones, SCORM…) se completan al verlos'
+                           : 'Ningún contenido tiene configurada la finalización «ver»')],
+    ['Mensajes del tutor a los alumnos', s.tutData && s.nStudents > 0 && s.nTutContact === s.nStudents ? true : 'warn',
+      s.tutData ? s.nTutContact + '/' + s.nStudents + ' alumnos con al menos un mensaje del tutor (privado o respuesta en foro)'
+                : 'Añadir las funciones de mensajería y foros al servicio para medirlo']
   ];
   var nOk = checks.filter(function (ch) { return ch[1] === true; }).length;
   var checkRows = checks.map(function (ch, i) {
@@ -610,13 +975,13 @@ function fundaeRender() {
     '<p class="fp-muted" style="margin:8px 0 0;">⏱ Tiempo en curso: estimación desde los registros de eventos, con corte de sesión a ' +
     SESSION_GAP_MIN + ' min de inactividad. Pulsa el tiempo de un alumno para ver su desglose por días.</p>' +
     '</div></div>' +
+    fundaeRenderFundae() +
     '<div class="card fp-card"><div class="card-body">' +
     '<h5>' + hIc('🔗') + 'Informes oficiales de Moodle <span class="fp-muted" style="font-weight:400;">evidencia documental exportable</span></h5>' +
     links + '</div></div>';
 
   // Mantener el foco en el filtro que se está usando mientras se escribe.
-  var f = fundaeData.lastFilter === 'mod' ? document.getElementById('fp-modfilter')
-                                          : document.getElementById('fp-filter');
+  var f = document.getElementById({ mod: 'fp-modfilter', fundae: 'fp-ffilter' }[fundaeData.lastFilter] || 'fp-filter');
   if (f && f.value) { f.focus(); f.setSelectionRange(f.value.length, f.value.length); }
 
   document.getElementById('fp-timestamp').textContent = 'Actualizado: ' + new Date().toLocaleString();
@@ -801,6 +1166,236 @@ function fundaeCsvDays() {
   });
   if (lines.length === 1) return;
   fundaeDownloadCsv(lines, 'conexiones-diarias-fundae');
+}
+
+/* ============================================================
+ * INFORME DE SEGUIMIENTO FUNDAE (v3.1) · sección adicional
+ * ============================================================ */
+
+function fundaeProgress(txt) {
+  var el = document.getElementById('fp-progress');
+  if (el) el.textContent = txt;
+}
+
+// Barra de «contenidos visualizados» con el porcentaje centrado, como el informe tipo.
+function contBar(c) {
+  if (!c) return '<span class="fp-muted" title="Añade core_completion_get_activities_completion_status al servicio">n/d</span>';
+  if (!c.total) return '<span class="fp-muted" title="Ningún contenido tiene configurada la finalización «ver»">—</span>';
+  var p = c.pct, cls = p >= 75 ? 'fp-bar-ok' : (p >= 40 ? 'fp-bar-warn' : 'fp-bar-fail');
+  // Con la barra casi llena (verde), el texto centrado queda sobre el relleno: en blanco.
+  return '<div class="fp-pbar" title="' + c.seen + ' de ' + c.total + ' contenidos vistos">' +
+    '<i class="' + cls + '" style="width:' + p + '%;"></i><b' + (p >= 75 ? ' style="color:#fff;"' : '') + '>' +
+    fmtPct(p) + ' %</b></div>' +
+    '<span class="fp-sub-num">' + c.seen + ' de ' + c.total + ' contenidos</span>';
+}
+
+function fundaeRenderFundae() {
+  var students = fundaeData.students, c = fundaeData.course;
+  var k = fundaeData.fSortKey, dir = fundaeData.fSortDir;
+  function val(st) {
+    if (k === 'contpct') return st.cont && st.cont.pct !== null ? st.cont.pct : null;
+    var v = st[k];
+    return v === undefined ? null : v;
+  }
+  var sorted = students.slice().sort(function (a, b) {
+    var va = val(a), vb = val(b);
+    if (va === null && vb === null) return 0;
+    if (va === null) return 1;
+    if (vb === null) return -1;
+    if (typeof va === 'string') return va.localeCompare(vb) * dir;
+    return (va - vb) * dir;
+  });
+  var filter = (document.getElementById('fp-ffilter') || {}).value || '';
+  var fl = filter.toLowerCase();
+  var NO_LOG = 'Sin acceso a los registros: hace falta el permiso report/log:view en el curso';
+
+  function lnk(uid, html, title) {
+    return '<a href="javascript:void(0)" class="fp-num-link" onclick="fundaeFToggle(' + uid + ')" title="' +
+      esc(title || 'Ver el detalle del alumno') + '">' + html + '</a>';
+  }
+  function nd(title) { return '<span class="fp-muted" title="' + esc(title) + '">n/d</span>'; }
+  function dt2(ts) {
+    return ts ? '<span class="fp-2l">' + fmtD(ts) + '<br><small>' + fmtT(ts) + '</small></span>'
+              : '<span class="fp-muted">—</span>';
+  }
+
+  var rows = sorted.filter(function (st) {
+    return !fl || st.name.toLowerCase().indexOf(fl) >= 0 || st.email.toLowerCase().indexOf(fl) >= 0;
+  }).map(function (st) {
+    var open = !!fundaeData.fExpanded[st.uid];
+    var tut = st.tutTotal === null ? nd('Faltan las funciones de mensajería y foros en el servicio')
+      : lnk(st.uid, st.tutTotal) + '<span class="fp-sub-num">' +
+        (st.tutPriv === null ? 'priv. n/d' : st.tutPriv + ' priv.') +
+        (CONTAR_RESPUESTAS_FORO ? ' · ' + (st.tutForo === null ? 'foro n/d' : st.tutForo + ' foro') : '') + '</span>';
+    var html = '<tr>' +
+      '<td><a href="javascript:void(0)" class="fp-tg" onclick="fundaeFToggle(' + st.uid + ')" ' +
+      'title="Ver sesiones, contenidos y mensajes">' + car(open) + esc(st.name) + '</a></td>' +
+      '<td>' + (st.sesList === null ? nd(NO_LOG) : dt2(st.first)) + '</td>' +
+      '<td>' + dt2(st.lastCourse) + '</td>' +
+      '<td style="text-align:center;">' + (st.sessions === null ? nd(NO_LOG) : lnk(st.uid, st.sessions)) + '</td>' +
+      '<td style="white-space:nowrap;">' + (st.time === null ? nd(NO_LOG)
+        : lnk(st.uid, fmtDurS(st.time), 'Ver cómo se acumula, sesión a sesión')) + '</td>' +
+      '<td>' + contBar(st.cont) + '</td>' +
+      '<td style="text-align:center;">' + tut + '</td>' +
+      '<td style="text-align:center;">' + (st.foroPosts === null ? nd('Sin datos de foros ni de registros')
+        : lnk(st.uid, st.foroPosts)) + '</td>' +
+      '<td style="text-align:center;">' + (st.chats === null ? nd(NO_LOG) : lnk(st.uid, st.chats)) + '</td>' +
+      '</tr>';
+    if (open) html += '<tr class="fp-detail"><td colspan="9">' + fundaeDetailHtml(st) + '</td></tr>';
+    return html;
+  }).join('');
+
+  function fth(key, label, title, center) {
+    var arrow = fundaeData.fSortKey === key ? (fundaeData.fSortDir === 1 ? ' ▲' : ' ▼') : '';
+    return '<th class="fp-sortable"' + (center ? ' style="text-align:center;"' : '') +
+      (title ? ' title="' + esc(title) + '"' : '') + ' onclick="fundaeFSort(\'' + key + '\')">' + label + arrow + '</th>';
+  }
+  var periodo = c.startdate ? fmtD(c.startdate) + ' y ' + (c.enddate ? fmtD(c.enddate) : 'hoy') : 'las fechas del curso';
+  var regla = DURACION_SESION_DESCRIPCION.charAt(0).toUpperCase() + DURACION_SESION_DESCRIPCION.slice(1);
+  var method = '<details class="fp-method"' + (fundaeData.methodOpen ? ' open' : '') +
+    ' ontoggle="fundaeData.methodOpen=this.open">' +
+    '<summary>ℹ️ Cómo se calcula cada columna</summary><dl>' +
+    '<dt>Registros (sesiones)</dt><dd>Cada sesión agrupa los eventos del alumno en el curso separados por menos de ' +
+      SESSION_GAP_MIN + ' min. Un hueco mayor cierra la sesión y la siguiente actividad abre otra.</dd>' +
+    '<dt>Tiempo de cada sesión</dt><dd>' + esc(regla) + '.</dd>' +
+    '<dt>Tiempo acumulado</dt><dd>Suma del tiempo de todas las sesiones. En el detalle de cada alumno, ' +
+      'la columna «Acumulado» muestra la suma sesión a sesión.</dd>' +
+    '<dt>Primer y último acceso</dt><dd>Primer evento del alumno en los registros del curso y último acceso al curso.</dd>' +
+    '<dt>Contenidos visualizados</dt><dd>Contenidos cuya finalización exige verlos (archivos, libros, lecciones, ' +
+      'SCORM…) que el alumno ha visto, sobre el total. No cuentan secciones, subsecciones ni áreas de texto.</dd>' +
+    '<dt>Mensajes tutor</dt><dd>Mensajes privados que el tutor conectado ha enviado al alumno entre ' + periodo +
+      (CONTAR_RESPUESTAS_FORO ? ', más las respuestas de los tutores a mensajes del alumno en los foros' : '') + '.</dd>' +
+    '<dt>Mensajes foros</dt><dd>Mensajes publicados por el alumno en los foros del curso (debates iniciados y respuestas).</dd>' +
+    '<dt>Mensajes chats</dt><dd>Mensajes enviados por el alumno en las actividades de chat.</dd>' +
+    '<dt>Naturaleza del dato</dt><dd>El tiempo es una estimación a partir de los registros. La evidencia bruta, ' +
+      'evento a evento, está en el informe «Registros» del curso.</dd>' +
+    '</dl></details>';
+
+  return '<div class="card fp-card"><div class="card-body">' +
+    '<h5><span class="fp-h-ic">📑</span>Informe de seguimiento FUNDAE' +
+    '<input id="fp-ffilter" class="fp-filter fp-noprint" placeholder="🔍 Filtrar alumno…" value="' + esc(filter) + '" ' +
+    'oninput="fundaeData.lastFilter=\'fundae\';fundaeRender()"></h5>' +
+    method +
+    '<div class="table-responsive"><table class="table-hover"><thead><tr>' +
+    fth('name', 'Nombre') + fth('first', 'Primer<br>acceso') + fth('lastCourse', 'Último<br>acceso') +
+    fth('sessions', 'Registros<br>(sesiones)', 'Número de sesiones', true) +
+    fth('time', 'Tiempo<br>acumulado', 'Suma de la duración de todas las sesiones') +
+    fth('contpct', 'Contenidos<br>visualizados', 'Contenidos con finalización por vista que el alumno ha visto') +
+    fth('tutTotal', 'Mensajes<br>tutor', 'Mensajes del tutor al alumno', true) +
+    fth('foroPosts', 'Mensajes<br>foros', 'Mensajes del alumno en los foros', true) +
+    fth('chats', 'Mensajes<br>chats', 'Mensajes del alumno en los chats', true) +
+    '</tr></thead><tbody>' +
+    (rows || '<tr><td colspan="9" class="fp-muted">Sin alumnos' + (filter ? ' que coincidan con el filtro' : ' matriculados') + '</td></tr>') +
+    '</tbody></table></div>' +
+    (fundaeData.truncated ? '<p class="fp-muted" style="margin:8px 0 0;">Mostrando los primeros ' + students.length + ' alumnos (límite PoC).</p>' : '') +
+    '<p class="fp-muted" style="margin:8px 0 0;">Pulsa el nombre, el tiempo o cualquier cifra para ver las sesiones ' +
+    'con su acumulado, los contenidos vistos y pendientes y el desglose de mensajes.</p>' +
+    '</div></div>';
+}
+
+// Detalle de un alumno: sesiones con acumulado, contenidos y mensajes.
+function fundaeDetailHtml(st) {
+  var c = fundaeData.course;
+  var sesHtml;
+  if (st.sesList === null) {
+    sesHtml = '<p class="fp-muted">Sin acceso a los registros del curso (permiso report/log:view).</p>';
+  } else if (!st.sesList.length) {
+    sesHtml = '<p class="fp-muted">El alumno no tiene eventos registrados en el curso.</p>';
+  } else {
+    var nZero = 0;
+    var body = st.sesList.map(function (x) {
+      if (x.seconds === 0) nZero++;
+      return '<tr><td class="fp-muted">' + x.n + '</td><td>' + fmtD(x.start) + '</td>' +
+        '<td>' + fmtT(x.start, true) + '</td><td>' + fmtT(x.end, true) + '</td>' +
+        '<td style="text-align:center;">' + x.events + '</td>' +
+        '<td' + (x.seconds === 0 ? ' class="fp-zero" title="Sin tiempo acreditable con la regla actual (por ejemplo, un solo evento)"' : '') + '>' +
+        fmtDurS(x.seconds) + '</td><td><b>' + fmtDurS(x.acumulado) + '</b></td></tr>';
+    }).join('');
+    sesHtml = '<div class="fp-scroll" style="max-height:300px;"><table><thead><tr>' +
+      '<th>#</th><th>Fecha</th><th>Inicio</th><th>Fin</th><th style="text-align:center;">Eventos</th>' +
+      '<th>Duración</th><th>Acumulado</th></tr></thead><tbody>' + body + '</tbody>' +
+      '<tfoot><tr><td colspan="5">Total: ' + st.sesList.length + (st.sesList.length === 1 ? ' sesión' : ' sesiones') +
+      '</td><td colspan="2">' + fmtDurS(st.time) + '</td></tr></tfoot></table></div>' +
+      '<p class="fp-muted" style="margin:6px 0 0;">Una sesión se cierra tras ' + SESSION_GAP_MIN + ' min sin eventos. ' +
+      'Duración: ' + esc(DURACION_SESION_DESCRIPCION) + '. Acumulado: suma hasta esa sesión.' +
+      (nZero ? ' ' + nZero + (nZero === 1 ? ' sesión suma' : ' sesiones suman') + ' 0 s con la regla actual.' : '') + '</p>';
+  }
+
+  var ct = st.cont, contHtml;
+  if (!ct) contHtml = '<p class="fp-muted">Sin datos: añade core_completion_get_activities_completion_status al servicio.</p>';
+  else if (!ct.total) contHtml = '<p class="fp-muted">Ningún contenido del curso tiene configurada la finalización «ver».</p>';
+  else contHtml = '<ul class="fp-cont">' + ct.list.map(function (x) {
+      return '<li>' + (x.seen ? '<span class="fp-yes">✔</span> ' : '<span class="fp-no">✘</span> ') +
+        esc(x.name) + ' <span class="fp-muted">· ' + esc(x.type) + '</span></li>';
+    }).join('') + '</ul>';
+
+  function n(v) { return v === null || v === undefined ? '<span class="fp-muted">n/d</span>' : '<b>' + v + '</b>'; }
+  var msgHtml = '<table><tbody>' +
+    '<tr><td>Mensajes privados del tutor</td><td style="text-align:right;">' + n(st.tutPriv) + '</td></tr>' +
+    '<tr><td>Respuestas de tutores en foros</td><td style="text-align:right;">' + n(st.tutForo) + '</td></tr>' +
+    '<tr><td><b>Mensajes tutor (total)</b></td><td style="text-align:right;">' + n(st.tutTotal) + '</td></tr>' +
+    '<tr><td>Mensajes del alumno en foros</td><td style="text-align:right;">' + n(st.foroPosts) + '</td></tr>' +
+    '<tr><td>Mensajes del alumno en chats</td><td style="text-align:right;">' + n(st.chats) + '</td></tr>' +
+    '</tbody></table>' +
+    '<p class="fp-muted" style="margin:6px 0 0;">Privados: solo los del tutor conectado' +
+    (c.startdate ? ', entre ' + fmtD(c.startdate) + ' y ' + (c.enddate ? fmtD(c.enddate) : 'hoy') : '') + '. ' +
+    (CONTAR_RESPUESTAS_FORO ? 'El total incluye las respuestas en foros. ' : 'El total no incluye las respuestas en foros. ') +
+    'Foros del alumno: ' + (st.foroSrc === 'api' ? 'mensajes publicados (sin los borrados).'
+      : (st.foroSrc === 'log' ? 'eventos de creación en los registros.' : 'sin datos.')) + '</p>';
+
+  return '<div class="fp-det">' +
+    '<div class="fp-det-wide"><h6>⏱ Sesiones y tiempo acumulado</h6>' + sesHtml + '</div>' +
+    '<div><h6>📚 Contenidos con finalización por vista' + (ct && ct.total ? ' · ' + ct.seen + ' de ' + ct.total : '') +
+    '</h6>' + contHtml + '</div>' +
+    '<div><h6>💬 Mensajes</h6>' + msgHtml + '</div>' +
+    '</div>';
+}
+
+function fundaeFSort(key) {
+  if (fundaeData.fSortKey === key) fundaeData.fSortDir *= -1;
+  else { fundaeData.fSortKey = key; fundaeData.fSortDir = key === 'name' ? 1 : -1; }
+  fundaeRender();
+}
+
+function fundaeFToggle(uid) {
+  fundaeData.fExpanded[uid] = !fundaeData.fExpanded[uid];
+  fundaeRender();
+}
+
+// Una fila por alumno con las columnas del informe tipo y su desglose.
+function fundaeCsvFundae() {
+  var s = fundaeData.students;
+  if (!s.length) return;
+  function v(x) { return x === null || x === undefined ? '' : x; }
+  var head = ['Alumno', 'Email', 'Primer acceso', 'Último acceso', 'Registros (sesiones)',
+    'Tiempo acumulado (h:mm:ss)', 'Tiempo acumulado (s)', 'Contenidos vistos',
+    'Contenidos con finalización por vista', 'Contenidos visualizados (%)', 'Mensajes tutor (total)',
+    'Mensajes privados del tutor', 'Respuestas de tutores en foros', 'Mensajes en foros', 'Mensajes en chats'];
+  var lines = [head.map(csvCell).join(';')].concat(s.map(function (st) {
+    var ct = st.cont;
+    return [st.name, st.email, fmtDT(st.first), fmtDT(st.lastCourse), v(st.sessions),
+      fmtHMS(st.time), v(st.time), ct ? ct.seen : '', ct ? ct.total : '',
+      ct && ct.pct !== null ? fmtPct(ct.pct) : '', v(st.tutTotal), v(st.tutPriv), v(st.tutForo),
+      v(st.foroPosts), v(st.chats)].map(csvCell).join(';');
+  }));
+  fundaeDownloadCsv(lines, 'informe-seguimiento-fundae');
+}
+
+// Una fila por alumno y sesión, con el acumulado: muestra cómo se llega al total.
+function fundaeCsvSesiones() {
+  var s = fundaeData.students;
+  if (!s.length) return;
+  var head = ['Alumno', 'Email', 'Sesión', 'Fecha', 'Inicio', 'Fin', 'Eventos',
+    'Duración (s)', 'Duración (h:mm:ss)', 'Acumulado (s)', 'Acumulado (h:mm:ss)'];
+  var lines = [head.map(csvCell).join(';')];
+  s.forEach(function (st) {
+    (st.sesList || []).forEach(function (x) {
+      lines.push([st.name, st.email, x.n, fmtD(x.start), fmtT(x.start, true), fmtT(x.end, true), x.events,
+        x.seconds, fmtHMS(x.seconds), x.acumulado, fmtHMS(x.acumulado)].map(csvCell).join(';'));
+    });
+  });
+  if (lines.length === 1) return;
+  fundaeDownloadCsv(lines, 'sesiones-fundae');
 }
 
 // Se ejecuta en cada carga de la página → datos siempre frescos.
