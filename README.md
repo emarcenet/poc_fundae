@@ -1,8 +1,10 @@
-# PoC — Panel de evidencias FUNDAE para Moodle 4.5 / 5 (sin plugins)
+# PoC — Panel de evidencias FUNDAE para Moodle 4.5 / 5.x y Open LMS (sin plugins)
 
-> Compatibilidad verificada contra el código fuente de las ramas
-> MOODLE_405_STABLE y MOODLE_500_STABLE: las cinco funciones de la API que usa
-> el panel existen en ambas versiones con la misma firma.
+> Versión actual: **v3.1**. Compatibilidad verificada contra el código fuente de
+> las ramas MOODLE_405_STABLE, MOODLE_500_STABLE y MOODLE_501_STABLE (núcleo de
+> Open LMS 5.1.4): las funciones de la API que usa el panel existen en las tres
+> con la misma firma. La v3.1 se ha probado con un Moodle simulado; queda
+> pendiente probarla en una plataforma real.
 
 Prueba de concepto de un panel embebido en un curso Moodle que consulta la API
 y muestra una lista de comprobaciones (checklist) orientada a los requisitos de
@@ -22,6 +24,10 @@ solo configuración de administración.
      sesiones y por días, progreso, estado de finalización y nota final.
   4. **Enlaces directos a los informes nativos** del curso (registros, participación,
      finalización, calificaciones), que son la evidencia documental exportable.
+  5. **Informe de seguimiento FUNDAE** *(v3.1)*: tabla con las columnas del informe
+     tipo (primer y último acceso, registros, tiempo acumulado, contenidos
+     visualizados y mensajes del tutor, en foros y en chats), con el detalle de
+     cada alumno sesión a sesión. Ver [Informe de seguimiento FUNDAE](#informe-de-seguimiento-fundae-v31).
 - Se actualiza en cada visita (los datos se piden en vivo). Incluye botón «Actualizar».
 
 ## Modelo de seguridad: token personal por tutor
@@ -66,8 +72,14 @@ Funciones de la API utilizadas (hay que añadirlas todas al servicio):
 - `core_course_get_contents`
 - `core_enrol_get_enrolled_users`
 - `core_completion_get_course_completion_status`
-- `core_completion_get_activities_completion_status` *(para el % de progreso por alumno; si no se añade, el panel funciona igual pero esa columna muestra «n/d»)*
+- `core_completion_get_activities_completion_status` *(para el % de progreso y, desde la v3.1, para «Contenidos visualizados»; si no se añade, esas columnas muestran «n/d»)*
 - `gradereport_user_get_grade_items`
+
+Nuevas en la v3.1, para el informe de seguimiento (si falta alguna, solo su
+columna muestra «n/d»; el resto del panel funciona igual):
+
+- `core_message_get_conversations` y `core_message_get_conversation_messages` *(mensajes privados del tutor)*
+- `mod_forum_get_forums_by_courses`, `mod_forum_get_forum_discussions` y `mod_forum_get_discussion_posts` *(mensajes del alumno en foros y respuestas de los tutores)*
 
 ## Configuración en Moodle (una sola vez, como administrador)
 
@@ -85,7 +97,7 @@ Funciones de la API utilizadas (hay que añadirlas todas al servicio):
      `gradereport/overview:view`), no funciones — no es ahí donde se añaden.
 3. Guardar. De vuelta en la **tabla de servicios externos**, en la fila de
    `FUNDAE PoC`, pulsar el enlace **«Funciones»** (no «Editar») → botón
-   **«Agregar funciones»** → pegar los nombres de las 5 funciones en el
+   **«Agregar funciones»** → pegar los nombres de las funciones en el
    buscador y confirmar. Las funciones se reconocen porque van con guiones
    bajos y descripción en inglés (p. ej.
    `core_course_get_contents: Get course contents`); si las sugerencias llevan
@@ -155,6 +167,8 @@ con esa opción activada.
 | El servicio no aparece en Claves de seguridad | Tutor sin `moodle/webservice:createtoken`, o no autorizado en el servicio | Paso 3 |
 | «Excepción de control de acceso» (`accessexception`) | Función no añadida al servicio, o tutor sin `webservice/rest:use`, o no autorizado | Pasos 2 y 3 |
 | «No tiene permiso…» en una función concreta | Al tutor le falta esa capacidad en el curso (p. ej. ver finalización) | Revisar su rol en el curso |
+| «n/d» en Mensajes tutor *(v3.1)* | Faltan las funciones de mensajería o de foros en el servicio | Paso 2: añadir las funciones nuevas de la v3.1 |
+| «—» en Contenidos visualizados *(v3.1)* | Ningún contenido tiene la finalización «ver» configurada | Configurar la finalización por vista en archivos, libros, lecciones, SCORM… |
 
 ## Comprobaciones incluidas en la PoC
 
@@ -172,6 +186,64 @@ con esa opción activada.
 | 10 | Hay calificaciones registradas | Evidencia de evaluación efectiva |
 | 11 | % de alumnos con progreso ≥ 75 % de actividades | Criterio de aprovechamiento |
 | 12 | % de alumnos con el curso completado | Indicador de finalización |
+| 13 | Contenidos con finalización por vista configurada *(v3.1)* | Sin ella no se puede medir «Contenidos visualizados» |
+| 14 | Alumnos con al menos un mensaje del tutor *(v3.1)* | Evidencia de tutorización individual |
+
+## Informe de seguimiento FUNDAE (v3.1)
+
+Sección adicional del panel con las columnas del informe de seguimiento tipo.
+Cada cifra es un enlace que despliega el detalle del alumno: sus sesiones con
+el tiempo acumulado, los contenidos vistos y pendientes, y el desglose de
+mensajes.
+
+| Columna | Criterio | Fuente |
+|---------|----------|--------|
+| Primer acceso | Primer evento del alumno en los registros del curso | `report/log` (sesión del tutor) |
+| Último acceso | Último acceso al curso | `core_enrol_get_enrolled_users` (`lastcourseaccess`) |
+| Registros | Número de sesiones | `report/log` |
+| Tiempo acumulado | Suma de la duración de todas las sesiones | `report/log` |
+| Contenidos visualizados | Contenidos cuya finalización exige verlos (archivos, libros, lecciones, SCORM…) que el alumno ha visto, sobre el total. No cuentan secciones, subsecciones ni áreas de texto | `core_completion_get_activities_completion_status` (regla `completionview`) |
+| Mensajes tutor | Mensajes privados del tutor conectado al alumno, dentro de las fechas del curso, más las respuestas de los tutores a mensajes del alumno en los foros (incluidas las respuestas privadas) | Mensajería y foros (API) |
+| Mensajes foros | Mensajes publicados por el alumno (debates iniciados y respuestas; sin los borrados) | Foros (API); si faltan las funciones, eventos de creación en `report/log` |
+| Mensajes chats | Mensajes enviados por el alumno en las actividades de chat | `report/log` |
+
+### Cómo se cuenta el tiempo
+
+1. **Sesiones.** Los eventos del alumno se ordenan por hora. Si entre dos
+   eventos consecutivos pasan más de `SESSION_GAP_MIN` minutos (30 por
+   defecto), se cierra la sesión y la siguiente actividad abre otra.
+2. **Duración de cada sesión.** La decide la función `fundaeDuracionSesion()`,
+   al principio del script. Por defecto, del primer al último evento: una
+   sesión de un solo evento suma 0 s, porque Moodle no registra el tiempo de
+   lectura que sigue al último clic. El texto que lo explica en el panel está
+   en `DURACION_SESION_DESCRIPCION`.
+3. **Tiempo acumulado.** Suma de la duración de todas las sesiones. En el
+   detalle del alumno, la columna «Acumulado» muestra la suma sesión a sesión,
+   y el botón **«CSV sesiones»** exporta una fila por alumno y sesión con ese
+   acumulado.
+
+### Exportaciones
+
+- **CSV informe FUNDAE**: una fila por alumno con las columnas del informe y su desglose.
+- **CSV sesiones**: una fila por alumno y sesión (fecha, inicio, fin, eventos, duración y acumulado).
+
+### Ajustes al inicio del script
+
+- `SESSION_GAP_MIN`: minutos de inactividad que cierran una sesión (30).
+- `ROLES_TUTOR`: roles que cuentan como tutor en los foros (`editingteacher`, `teacher`). El tutor conectado cuenta siempre.
+- `EXCLUIR_CONTENIDOS`: tipos que nunca cuentan como contenido (`label`, `subsection`, `qbank`).
+- `CONTAR_RESPUESTAS_FORO`: `true` suma las respuestas en foros a «Mensajes tutor»; `false` cuenta solo los mensajes privados.
+- `CONCURRENCIA`: peticiones simultáneas máximas (6), para no saturar la plataforma.
+
+### Límites conocidos
+
+- Los mensajes privados de Moodle no pertenecen a un curso: se acotan a las
+  fechas del curso y solo se ven los del tutor conectado (es su token).
+- El tiempo es una estimación a partir de los registros. No ve el tiempo de
+  lectura sin clics (por ejemplo, dentro de un SCORM largo).
+- En Open LMS falta comprobar en una plataforma real que se pueda guardar
+  `<script>` en un recurso Página y que la conexión automática funcione con
+  el tema Snap.
 
 ## Seguridad: modelo de amenazas y límites residuales
 
@@ -242,8 +314,8 @@ Método de cálculo (el mismo que usan los bloques de "dedicación"):
 1. Se descargan los eventos del alumno en el curso, ordenados por hora.
 2. Se agrupan en **sesiones**: si entre dos eventos consecutivos pasan más de
    `SESSION_GAP_MIN` minutos de inactividad, se cierra la sesión y empieza otra.
-3. Duración de cada sesión = último evento − primer evento. El tiempo total es
-   la suma de sesiones.
+3. La duración de cada sesión la calcula `fundaeDuracionSesion()` (por defecto,
+   último evento − primer evento). El tiempo total es la suma de sesiones.
 4. Las sesiones se agrupan también **por día natural**: en la tabla, pulsar
    sobre el tiempo de un alumno despliega su desglose diario (día, nº de
    sesiones, tiempo), y el botón **«CSV por días»** exporta una fila por
@@ -259,6 +331,12 @@ exportable (la evidencia bruta para una inspección) sigue siendo el informe
 
 Notas:
 
+- **Formato de la descarga (corregido en la v3.1).** La descarga JSON de
+  Moodle 4.5 y 5.x es una lista de hojas (`[[{fila}, {fila}…]]`). La v3.0
+  recorría el nivel exterior y no leía ninguna hora, así que el tiempo salía a
+  cero. La v3.1 aplana la lista y lee la hora con el formato de fecha del
+  idioma del tutor (`strftimedatetimeshortaccurate`, obtenido con
+  `core_get_string`), para no confundir día y mes en idiomas como `en_us`.
 - Si la columna «Tiempo en curso» muestra **n/d**, el usuario que ve la página
   no tiene `report/log:view` en el curso, o el formato de descarga JSON está
   deshabilitado (Administración del sitio → Extensiones → Formatos de datos).

@@ -10,7 +10,63 @@ en uso (`panel-fundae.html`) es siempre la más reciente.
 
 ---
 
-## [3.0.0] — Auto-conexión (versión actual)
+## [3.1.0] — Informe de seguimiento FUNDAE (versión actual)
+
+Archivo: [`versions/panel-fundae-v3.1.html`](versions/panel-fundae-v3.1.html)
+· también publicado como `panel-fundae.html`. Versión menor: el modelo de
+autenticación no cambia.
+
+### Añadido
+- **Informe de seguimiento FUNDAE**, como sección adicional: primer acceso,
+  último acceso, registros (sesiones), tiempo acumulado, contenidos
+  visualizados y mensajes del tutor, en foros y en chats.
+- **Detalle por alumno** con sus sesiones (fecha, inicio, fin, eventos,
+  duración) y el **tiempo acumulado sesión a sesión**, más los contenidos
+  vistos y pendientes y el desglose de mensajes.
+- Recuadro **«Cómo se calcula cada columna»** dentro del propio panel.
+- **Contenidos visualizados**: contenidos cuya finalización exige verlos
+  (regla `completionview`), sin secciones, subsecciones ni áreas de texto.
+- **Mensajes tutor**: mensajes privados del tutor conectado dentro de las
+  fechas del curso, más las respuestas de los tutores a mensajes del alumno
+  en los foros (incluidas las privadas). Ajustable con `CONTAR_RESPUESTAS_FORO`.
+- **Mensajes foros** (sin los borrados) y **mensajes chats**.
+- Exportaciones **«CSV informe FUNDAE»** y **«CSV sesiones»** (con acumulado).
+- Dos comprobaciones nuevas en el checklist: contenidos con finalización por
+  vista y alumnos con mensajes del tutor (14 en total).
+- Indicador de progreso durante la carga y límite de peticiones simultáneas
+  (`CONCURRENCIA`).
+- Funciones nuevas en el servicio externo: `core_message_get_conversations`,
+  `core_message_get_conversation_messages`, `mod_forum_get_forums_by_courses`,
+  `mod_forum_get_forum_discussions` y `mod_forum_get_discussion_posts`.
+  Si faltan, solo su columna muestra «n/d».
+
+### Corregido
+- **Tiempo de conexión a cero.** La descarga JSON de `report/log` en Moodle
+  4.5 y 5.x es una lista de hojas (`[[…]]`). La v3.0 recorría el nivel
+  exterior y no leía ninguna hora. La v3.1 aplana la lista antes de leerla.
+- **Fechas según el idioma.** La hora se lee con el formato
+  `strftimedatetimeshortaccurate` del idioma del tutor (`core_get_string`,
+  AJAX con la sesión). Así no se confunden día y mes en idiomas como `en_us`.
+
+### Cambiado
+- La duración de cada sesión se calcula en una función aislada,
+  `fundaeDuracionSesion()`, para poder fijar el criterio de acreditación sin
+  tocar el resto del código. Por defecto, del primer al último evento.
+- El curso se detecta primero con `M.cfg.courseId` y el tutor conectado con
+  `M.cfg.userId` (Moodle 4.x/5.x).
+- `core_completion_get_activities_completion_status` pasa a ser necesaria
+  para «Contenidos visualizados».
+
+### Verificación
+- Funciones y textos de evento comprobados contra el código de
+  MOODLE_501_STABLE, núcleo de Open LMS 5.1.4.
+- Probada con un Moodle simulado (39 comprobaciones, en dos escenarios:
+  completo y sin funciones de mensajería ni foros). Pendiente: prueba en
+  una plataforma real.
+
+---
+
+## [3.0.0] — Auto-conexión
 
 Archivo: [`versions/panel-fundae-v3.0.html`](versions/panel-fundae-v3.0.html)
 · también publicado como `panel-fundae.html`.
@@ -105,6 +161,7 @@ compartido incrustado** en el código (constante `WSTOKEN`).
 ## Compatibilidad
 
 Todas las versiones son compatibles con **Moodle 4.5 y 5** (verificado contra
-las ramas `MOODLE_405_STABLE` y `MOODLE_500_STABLE`). Requieren servicios web +
-protocolo REST activados y un servicio externo con las funciones indicadas en el
-[`README.md`](README.md). Sin plugins.
+las ramas `MOODLE_405_STABLE` y `MOODLE_500_STABLE`). La v3.1 se ha verificado
+además contra `MOODLE_501_STABLE`, el núcleo de Open LMS 5.1.4. Requieren
+servicios web + protocolo REST activados y un servicio externo con las funciones
+indicadas en el [`README.md`](README.md). Sin plugins.

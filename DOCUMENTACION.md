@@ -1,7 +1,7 @@
 # Documentación del proceso — Panel de evidencias FUNDAE para Moodle
 
 > Prueba de concepto (PoC) de una aplicación que se conecta por API a Moodle
-> (4.5 y 5), lee el contexto del curso y los alumnos, y emite las evidencias de
+> (4.5 y 5.x, incluido Open LMS 5.1), lee el contexto del curso y los alumnos, y emite las evidencias de
 > seguimiento necesarias para una acción formativa bonificable por **FUNDAE**.
 > **Sin instalar plugins**: todo vive en una página HTML embebida en el curso.
 
@@ -73,8 +73,12 @@ real. Estos son los hitos en orden:
 | 14 | Pregunta sobre cookies para ocultar el token | Analizado y descartado (no aporta seguridad) |
 | 15 | Opción `sessionStorage` vs `localStorage` («Recordar») | — |
 | 16 | **UX inaceptable** del pegado manual del token | Resuelto: auto-conexión silenciosa (v3.0) |
+| 17 | Viabilidad en **Open LMS 5.1** (núcleo Moodle 5.1.4) | Verificado contra el código de MOODLE_501_STABLE |
+| 18 | **Informe de seguimiento FUNDAE** con las columnas del informe tipo | Sección adicional y detalle de sesiones con acumulado (v3.1) |
+| 19 | **Tiempos a cero**: la descarga JSON de registros llega anidada (`[[…]]`) | Resuelto: se aplana y la fecha se lee con el formato del idioma (v3.1) |
 
-Los hitos 1, 13 y 16 marcan los tres saltos de versión (ver §7).
+Los hitos 1, 13 y 16 marcan los tres saltos de versión mayor; el 18, la versión
+menor 3.1 (ver §7).
 
 ---
 
@@ -221,6 +225,52 @@ bloqueada para navegadores normales), por lo que esta vía es la mejor posible
 sin plugins. La auto-conexión hace exactamente lo que el tutor podría hacer a
 mano: **no escala privilegios**.
 
+### 5.8 Informe de seguimiento FUNDAE y tiempo por sesiones (v3.1)
+
+El punto de partida fue un informe tipo de otra plataforma, con nueve
+columnas: nombre, primer y último acceso, registros, tiempo acumulado,
+contenidos visualizados y mensajes del tutor, en foros y en chats. El objetivo
+era verlo en Open LMS sin plugins. Open LMS usa el núcleo de Moodle 5.1.4, así
+que todo se verificó contra el código de `MOODLE_501_STABLE`.
+
+Criterios acordados con el usuario:
+
+- **Registros** = número de sesiones.
+- **Contenidos visualizados** = contenidos cuya finalización exige verlos
+  (archivos, libros, lecciones, SCORM…). Quedan fuera secciones, subsecciones
+  y áreas de texto. Se lee de la regla `completionview` que devuelve
+  `core_completion_get_activities_completion_status` en `details`.
+- **Mensajes tutor** = mensajes del tutor a los alumnos, en privado y en los foros.
+
+Decisiones técnicas:
+
+- **Una sola descarga de registros por alumno** alimenta el primer acceso, las
+  sesiones, el tiempo, los chats y, de respaldo, los foros. Las descripciones
+  de evento están en inglés y Moodle no las traduce, así que se reconocen
+  igual en cualquier idioma del sitio.
+- **El tutor conectado** se obtiene de `M.cfg.userId`, sin añadir funciones al
+  servicio. Los mensajes privados se acotan a las fechas del curso, porque en
+  Moodle no pertenecen a ningún curso.
+- **Respuestas en foros**: se reconstruye el árbol de cada debate (`parentid`)
+  para contar las respuestas de los tutores a mensajes del alumno, también las
+  privadas.
+- **Duración de sesión aislada** en `fundaeDuracionSesion()`, para fijar el
+  criterio de acreditación sin tocar el resto. Si la función falla, se usa
+  fin − inicio y se avisa en la consola.
+
+**Fallo corregido.** Según el código de `dataformat_json` y de la exportación
+de tablas en 4.5 y 5.1, la descarga JSON de `report/log` es una lista de hojas
+(`[[{fila}…]]`). La v3.0 recorría el nivel exterior y no leía ninguna hora, de
+modo que el tiempo salía a cero; se confirmó pasando la v3.0 por el mismo
+Moodle simulado. La v3.1 aplana la lista y lee la hora con el formato
+`strftimedatetimeshortaccurate` del idioma del tutor (vía `core_get_string`),
+para no confundir día y mes.
+
+**Prueba.** Moodle simulado con cuatro alumnos, dos tutores, foros con
+respuestas privadas y borradas, chat y un mensaje anterior al curso: 39
+comprobaciones en dos escenarios (completo y sin mensajería ni foros). Falta
+la prueba en una plataforma real.
+
 ---
 
 ## 6. Modelo de seguridad (estado actual)
@@ -251,29 +301,36 @@ del proyecto. Cada versión es funcional y autónoma.
 | **v1.0** | Token de servicio **incrustado** en el código | Ninguna acción (token ya puesto) | ❌ Token expuesto en el frontend |
 | **v2.0** | **Token personal** por tutor, **pegado manual** | Copiar/pegar el token una vez | ✅ Sin escalada; mal UX |
 | **v3.0** | Token personal **auto-obtenido** por la sesión | **Ninguna acción** | ✅ Sin escalada; buen UX |
+| **v3.1** | Igual que v3.0 | **Ninguna acción** | ✅ Igual que v3.0; añade el informe de seguimiento FUNDAE |
 
 Las tres comparten **el mismo conjunto de funcionalidades** de informe
 (checklist de 12 puntos, inventario de actividades/SCORM, tiempo de conexión por
 sesiones y días, tabla por alumno, filtros, CSV, enlaces a informes oficiales,
-CSS inyectado desde JS). **Solo cambia cómo se autentica el panel.**
+CSS inyectado desde JS). **Solo cambia cómo se autentica el panel.** La v3.1
+añade sobre la v3.0 el informe de seguimiento FUNDAE y corrige la lectura de
+los registros (§5.8).
 
 Código de cada versión:
 
 - [`versions/panel-fundae-v1.0.html`](versions/panel-fundae-v1.0.html)
 - [`versions/panel-fundae-v2.0.html`](versions/panel-fundae-v2.0.html)
-- [`versions/panel-fundae-v3.0.html`](versions/panel-fundae-v3.0.html) (= `panel-fundae.html`, la actual)
+- [`versions/panel-fundae-v3.0.html`](versions/panel-fundae-v3.0.html)
+- [`versions/panel-fundae-v3.1.html`](versions/panel-fundae-v3.1.html) (= `panel-fundae.html`, la actual)
 
 > **Por qué se conservan v1.0 y v2.0**: v1.0 es la más simple de desplegar en un
 > entorno de pruebas cerrado y controlado (un solo token, sin pasos por tutor),
 > útil como demo rápida. v2.0 sirve donde la auto-conexión no aplique (p. ej.
 > políticas que impidan la regeneración automática de tokens, o pruebas con
-> cuentas de administrador). v3.0 es la recomendada para uso real.
+> cuentas de administrador). v3.1 es la recomendada para uso real.
 
 ---
 
 ## 8. Limitaciones de la PoC y camino a producción
 
 - **Tiempo de conexión** = estimación por sesiones de log, no medición exacta.
+  La regla de duración de cada sesión está en `fundaeDuracionSesion()`.
+- **Mensajes privados**: solo los del tutor conectado, acotados a las fechas
+  del curso (los mensajes de Moodle no pertenecen a ningún curso).
 - **Límite** de `MAX_ALUMNOS` (100) consultados por carga.
 - **Calificación "configurada"** = el módulo tiene ítem en el libro con nota
   máxima > 0; el detalle fino (método de calificación de un SCORM, etc.) no lo
