@@ -78,6 +78,7 @@ real. Estos son los hitos en orden:
 | 19 | **Tiempos a cero**: la descarga JSON de registros llega anidada (`[[…]]`) | Resuelto: se aplana y la fecha se lee con el formato del idioma (v3.1) |
 | 20 | Primera prueba real: «Sin acceso a los registros» sin causa visible | Lector de registros no forzado, respaldo en CSV y diagnóstico con el mensaje de Moodle (v3.1.1) |
 | 21 | Segunda prueba real: el diagnóstico muestra «[]]» | Es la salida de Moodle sin filas; se lee como cero eventos y la trazabilidad pasa a usar solo el acceso al curso (v3.1.2) |
+| 22 | Tercera prueba real: la Página muestra el código como texto | El filtro MathJax se activaba con una secuencia de la v3.1.2; se elimina y las pruebas la vigilan (v3.1.3) |
 
 Los hitos 1, 13 y 16 marcan los tres saltos de versión mayor; el 18, la versión
 menor 3.1 (ver §7).
@@ -303,6 +304,20 @@ Se corrigió además un fallo heredado: la trazabilidad usaba como respaldo el
 el curso contaba como «ha accedido». Ahora solo cuenta el acceso al curso.
 Lección para las pruebas: el Moodle simulado debe reproducir también las
 salidas vacías reales, no solo las respuestas con datos.
+
+### 5.11 Los filtros de texto también leen el script (v3.1.3)
+
+Moodle aplica sus filtros de texto a todo el contenido de la Página, incluido
+el `<script>`. El filtro MathJax de 5.1 se activa si encuentra una barra
+invertida seguida de corchete o paréntesis, o dos dólares seguidos. Al
+activarse, convierte en texto las etiquetas HTML que hay entre llaves e
+inserta sus propias etiquetas, y el script deja de funcionar. La v3.1.2
+introdujo una de esas secuencias en una expresión regular; la v3.0, la v3.1 y
+la v3.1.1 no tenían ninguna. Se reescribió sin la secuencia, se añadió una
+guardia a las pruebas y se recomienda desactivar MathJax y Notación TeX en la
+Página del panel. Es la misma familia de problemas que el `<style>` que purga
+el editor (§5.4): el contenido pegado en Moodle pasa por varias capas antes de
+llegar al navegador.
 
 ---
 

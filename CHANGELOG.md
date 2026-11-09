@@ -10,7 +10,32 @@ en uso (`panel-fundae.html`) es siempre la más reciente.
 
 ---
 
-## [3.1.2] — Registros vacíos y acceso al curso (versión actual)
+## [3.1.3] — Compatibilidad con los filtros MathJax y TeX (versión actual)
+
+Archivo: [`versions/panel-fundae-v3.1.html`](versions/panel-fundae-v3.1.html)
+· también publicado como `panel-fundae.html`. Surge de la tercera prueba real:
+con la v3.1.2, la Página mostraba parte del código del panel como texto.
+
+### Corregido
+- La v3.1.2 incluía una expresión regular con una barra invertida seguida de
+  un corchete de apertura. El filtro MathJax de Moodle se activa con esa
+  secuencia, con una barra invertida seguida de paréntesis o con dos dólares
+  seguidos. Al activarse, convierte en texto las etiquetas HTML que hay entre
+  llaves e inserta sus propias etiquetas, lo que rompía el script. La
+  comprobación de descarga vacía se escribe ahora sin esa secuencia.
+
+### Añadido
+- Guardia en las pruebas: fallan si el panel contiene alguna secuencia que
+  active MathJax o la notación TeX.
+- Recomendación en el README: desactivar los filtros MathJax y Notación TeX
+  en la Página del panel.
+
+### Verificación
+- Guardia de filtros + 57 comprobaciones en siete escenarios.
+
+---
+
+## [3.1.2] — Registros vacíos y acceso al curso
 
 Archivo: [`versions/panel-fundae-v3.1.html`](versions/panel-fundae-v3.1.html)
 · también publicado como `panel-fundae.html`. Surge de la segunda prueba real,

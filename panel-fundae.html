@@ -29,7 +29,7 @@
  * defecto (se borra al cerrar) o localStorage si marca «Recordar» — y
  * consulta la API con sus propios permisos: si se filtra, no concede
  * más acceso del que ese tutor ya tiene. */
-var PANEL_VERSION = '3.1.2';
+var PANEL_VERSION = '3.1.3';
 var TOKEN_KEY = 'fundae_wstoken';
 var SERVICE_NAME = 'FUNDAE PoC'; // nombre del servicio externo en Moodle
 var MAX_ALUMNOS = 100;     // límite de alumnos consultados en la PoC
@@ -345,7 +345,11 @@ function fundaeParseDownload(txt, format) {
   if (format === 'json') {
     // Sin filas, Moodle cierra una hoja que nunca abrió y escribe «[]]»
     // (JSON no válido). No es un error: el alumno no tiene eventos.
-    if (/^\s*\[\s*\]\s*\]?\s*$/.test(txt)) return [];
+    // OJO: no escribir en este código barra invertida + corchete o paréntesis
+    // de apertura, ni dos signos de dólar seguidos: activan los filtros MathJax
+    // y TeX de Moodle, que alteran el script y lo rompen.
+    var compacto = txt.replace(/\s+/g, '');
+    if (compacto === '[]]' || compacto === '[]') return [];
     var data = null;
     try { data = JSON.parse(txt); } catch (e) {
       // Tolera avisos de PHP o espacios antes o después del JSON.

@@ -135,6 +135,12 @@ tienen `moodle/webservice:createtoken`, y **ningún** rol trae
 2. En el curso: activar edición → añadir recurso **Página** → pegar el código
    en el editor **en modo HTML** (botón `</>`).
 3. Marcar el recurso como **Oculto**: los estudiantes no lo verán; tutores y profesores sí.
+4. **Recomendado:** en la Página, *Más → Filtros*, desactivar **MathJax** y
+   **Notación TeX**. Esos filtros se activan con secuencias de fórmula (barra
+   invertida seguida de corchete o paréntesis, o dos dólares seguidos) y, si
+   aparecieran en el código, lo alterarían: la Página mostraría el código del
+   panel como texto. El panel no contiene esas secuencias desde la v3.1.3, y
+   las pruebas lo vigilan.
 
 ### Paso 5 — Primera conexión de cada tutor
 
@@ -170,6 +176,7 @@ con esa opción activada.
 | «n/d» en Mensajes tutor *(v3.1)* | Faltan las funciones de mensajería o de foros en el servicio | Paso 2: añadir las funciones nuevas de la v3.1 |
 | «—» en Contenidos visualizados *(v3.1)* | Ningún contenido tiene la finalización «ver» configurada | Configurar la finalización por vista en archivos, libros, lecciones, SCORM… |
 | «Atención» en Tiempos de conexión con «Moodle responde: …» *(v3.1.1)* | La descarga de registros devuelve una página de error | Leer el mensaje: permiso `report/log:view` en el curso, lector de registros, sesión caducada… |
+| La Página muestra el código del panel como texto | Un filtro de Moodle (MathJax o Notación TeX) ha alterado el script; pasó con la v3.1.2 | Usar la v3.1.3 o posterior y desactivar esos filtros en la Página (paso 4) |
 | «Moodle responde: «[]]»» *(v3.1.1; resuelto en la v3.1.2)* | El alumno no tiene eventos en los registros del curso: es la salida de Moodle sin filas | Actualizar a la v3.1.2, que lo lee como cero eventos |
 | «La descarga de registros funciona, pero no hay eventos de ningún alumno» *(v3.1.2)* | Los alumnos no han entrado en el curso, la plataforma ya ha borrado los registros o el lector activo no los guarda | Comprobar con una cuenta de alumno; revisar «Conservar registros durante» en el registro estándar |
 | Sin datos de finalización con un profesor sin permiso de edición | El curso está en grupos separados y ese rol no tiene «Acceder a todos los grupos» (`moodle/site:accessallgroups`) | Añadir al tutor a los grupos de sus alumnos o concederle ese permiso en el curso |
