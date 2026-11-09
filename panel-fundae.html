@@ -29,12 +29,15 @@
  * defecto (se borra al cerrar) o localStorage si marca «Recordar» — y
  * consulta la API con sus propios permisos: si se filtra, no concede
  * más acceso del que ese tutor ya tiene. */
-var PANEL_VERSION = '3.1.0';
+var PANEL_VERSION = '3.1.1';
 var TOKEN_KEY = 'fundae_wstoken';
 var SERVICE_NAME = 'FUNDAE PoC'; // nombre del servicio externo en Moodle
 var MAX_ALUMNOS = 100;     // límite de alumnos consultados en la PoC
 var SESSION_GAP_MIN = 30;  // minutos de inactividad que cierran una sesión
 var CONCURRENCIA = 6;      // peticiones simultáneas máximas (no saturar la plataforma)
+// Lector de registros de la descarga. Vacío = el que tenga activo la plataforma
+// (recomendado: Open LMS u otras instalaciones pueden no usar logstore_standard).
+var LOG_READER = '';
 var ROLES_TUTOR = ['editingteacher', 'teacher']; // roles que cuentan como tutor en los foros
 // Tipos que nunca cuentan como contenido. Las secciones no son módulos; las
 // subsecciones (5.x), las áreas de texto y los bancos de preguntas (5.x) sí.
@@ -325,36 +328,106 @@ function fundaeParseDate(txt) {
 var RX_FORO = /has created the (post|discussion) with id/;   // mensaje o debate creado
 var RX_CHAT = /has sent a message in the chat/;               // mensaje de chat
 
-// Devuelve [{ts, txt}] (hora del evento y texto completo de la fila) o null si
-// el usuario no puede ver los registros. IMPORTANTE: la descarga JSON de Moodle
-// (4.5 y 5.x) es una lista de hojas, [[{fila}, {fila}…]]. La v3.0 recorría el
-// nivel exterior y no llegaba a leer ninguna hora; aquí se aplana antes.
-function fundaeLogRows(courseid, userid) {
-  var p = new URLSearchParams({
-    chooselog: 1, id: courseid, user: userid, date: 0,
-    modid: '', modaction: '', origin: '', edulevel: -1,
-    logreader: 'logstore_standard', download: 'json'
-  });
-  return fetch(M.cfg.wwwroot + '/report/log/index.php?' + p.toString(), { credentials: 'same-origin' })
-    .then(function (r) { return r.text(); })
-    .then(function (txt) {
-      var data;
-      try { data = JSON.parse(txt); } catch (e) { return null; } // sin permiso → HTML, no JSON
-      if (!Array.isArray(data)) return null;
-      var rows = (data.length && Array.isArray(data[0])) ? [].concat.apply([], data) : data;
-      var out = [];
-      rows.forEach(function (row) {
-        if (!row || typeof row !== 'object') return;
-        var vals = Object.keys(row).map(function (k) { return row[k]; });
-        var ts = null;
-        // La hora es la primera columna; si cambiara el orden, se busca en el resto.
-        for (var i = 0; i < vals.length && ts === null; i++) ts = fundaeParseDate(vals[i]);
-        if (ts !== null) out.push({ ts: ts, txt: vals.join(' | ') });
-      });
-      return out;
-    })
-    .catch(function () { return null; });
+// Diagnóstico de la última carga: qué ha respondido Moodle cuando algo falla.
+// Se muestra en el checklist para no tener que adivinar la causa.
+var fundaeDiag = {};
+var fundaeLogVariant = null;        // formato de descarga que ha funcionado (json/csv)
+var LOG_FORMATOS = ['json', 'csv'];
+
+// Convierte la respuesta de una descarga en filas (arrays de valores), o null
+// si no son datos (página de error, inicio de sesión…). IMPORTANTE: la descarga
+// JSON de Moodle (4.5 y 5.x) es una lista de hojas, [[{fila}, {fila}…]]; la v3.0
+// recorría el nivel exterior y no leía ninguna hora. Aquí se aplana antes.
+function fundaeParseDownload(txt, format) {
+  txt = String(txt || '');
+  if (txt.charCodeAt(0) === 0xFEFF) txt = txt.slice(1); // marca BOM
+  if (format === 'json') {
+    var data = null;
+    try { data = JSON.parse(txt); } catch (e) {
+      // Tolera avisos de PHP o espacios antes o después del JSON.
+      var a = txt.indexOf('[['), b = txt.lastIndexOf(']]');
+      if (a >= 0 && b > a) { try { data = JSON.parse(txt.slice(a, b + 2)); } catch (e2) { data = null; } }
+    }
+    if (!Array.isArray(data)) return null;
+    var rows = (data.length && Array.isArray(data[0])) ? [].concat.apply([], data) : data;
+    return rows.filter(function (r) { return r && typeof r === 'object'; })
+      .map(function (r) { return Object.keys(r).map(function (k) { return r[k]; }); });
+  }
+  // CSV (RFC 4180): comillas, comas y saltos de línea dentro de los campos.
+  if (/^\s*</.test(txt)) return null; // es una página HTML, no datos
+  var out = [], row = [], field = '', q = false;
+  for (var i = 0; i < txt.length; i++) {
+    var ch = txt.charAt(i);
+    if (q) {
+      if (ch === '"') { if (txt.charAt(i + 1) === '"') { field += '"'; i++; } else q = false; }
+      else field += ch;
+    } else if (ch === '"') q = true;
+    else if (ch === ',') { row.push(field); field = ''; }
+    else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && txt.charAt(i + 1) === '\n') i++;
+      row.push(field); field = ''; out.push(row); row = [];
+    } else field += ch;
+  }
+  if (field !== '' || row.length) { row.push(field); out.push(row); }
+  if (!out.length || out[0].length < 5) return null; // sin la cabecera del informe
+  out.shift();
+  return out.filter(function (r) { return r.length > 1; });
 }
+
+// Extrae el mensaje de error de una página de Moodle (o el principio del texto).
+function fundaeErrorText(txt, status) {
+  var msg = '';
+  try {
+    var doc = new DOMParser().parseFromString(String(txt || ''), 'text/html');
+    var el = doc.querySelector('.errormessage') || doc.querySelector('.errorbox') ||
+      doc.querySelector('[role="main"] h2') || doc.querySelector('title');
+    msg = el ? el.textContent : (doc.body ? doc.body.textContent : '');
+  } catch (e) { msg = String(txt || ''); }
+  msg = String(msg).replace(/\s+/g, ' ').trim().slice(0, 220);
+  return (msg || 'respuesta vacía') + (status && status !== 200 ? ' (HTTP ' + status + ')' : '');
+}
+
+// Devuelve [{ts, txt}] (hora del evento y texto completo de la fila) o null si
+// no se pueden leer los registros. Usa el lector de registros activo y prueba
+// JSON y, si falla, CSV. El formato que funciona se reutiliza con el resto.
+function fundaeLogRows(courseid, userid) {
+  if (!fundaeLogVariant && (fundaeDiag.logFallos || 0) >= 2) return Promise.resolve(null); // no insistir
+  var order = fundaeLogVariant
+    ? [fundaeLogVariant].concat(LOG_FORMATOS.filter(function (f) { return f !== fundaeLogVariant; }))
+    : LOG_FORMATOS.slice();
+  function attempt(i) {
+    if (i >= order.length) { fundaeDiag.logFallos = (fundaeDiag.logFallos || 0) + 1; return Promise.resolve(null); }
+    var fmt = order[i], status = 0;
+    var p = { chooselog: 1, id: courseid, user: userid, date: 0, modid: '', modaction: '', origin: '',
+      edulevel: -1, download: fmt };
+    if (LOG_READER) p.logreader = LOG_READER;
+    return fetch(M.cfg.wwwroot + '/report/log/index.php?' + new URLSearchParams(p).toString(), { credentials: 'same-origin' })
+      .then(function (r) { status = r.status; return r.text(); })
+      .then(function (txt) {
+        var rows = fundaeParseDownload(txt, fmt);
+        if (rows === null) {
+          if (!fundaeDiag.log) fundaeDiag.log = { format: fmt, msg: fundaeErrorText(txt, status) };
+          return attempt(i + 1);
+        }
+        fundaeLogVariant = fmt;
+        var out = [];
+        rows.forEach(function (vals) {
+          var ts = null;
+          // La hora es la primera columna; si cambiara el orden, se busca en el resto.
+          for (var k = 0; k < vals.length && ts === null; k++) ts = fundaeParseDate(vals[k]);
+          if (ts !== null) out.push({ ts: ts, txt: vals.join(' | ') });
+        });
+        return out;
+      })
+      .catch(function (e) {
+        if (!fundaeDiag.log) fundaeDiag.log = { format: fmt, msg: 'Error de red: ' + (e && e.message ? e.message : e) };
+        return attempt(i + 1);
+      });
+  }
+  return attempt(0);
+}
+
+function diagTxt(m) { return 'Moodle responde: «' + String(m).replace(/[.\s]+$/, '') + '»'; }
 
 // Agrupa los eventos en sesiones por inactividad, acredita cada sesión con
 // fundaeDuracionSesion() y lleva el acumulado sesión a sesión.
@@ -437,7 +510,7 @@ function fundaeTutorMessages(course, studentIds) {
       list.forEach(function (x) { if (x) out[x.uid] = (out[x.uid] || 0) + x.n; });
       return out;
     })
-    .catch(function () { return null; });
+    .catch(function (e) { fundaeDiag.msgs = e.message; return null; });
 }
 
 // Recorre los foros del curso y cuenta, por alumno, sus mensajes publicados
@@ -474,7 +547,7 @@ function fundaeForumData(courseid, isStudent, isTutor) {
       });
       return { posts: posts, tutorReplies: replies };
     })
-    .catch(function () { return null; });
+    .catch(function (e) { fundaeDiag.forum = e.message; return null; });
 }
 
 // Agrupa las sesiones por día natural (clave aaaa-mm-dd, por fecha de inicio).
@@ -542,6 +615,8 @@ function fundaeRun() {
   var courseid = fundaeCourseId();
   if (!courseid) { out.innerHTML = '<div class="fp-error">No se ha podido detectar el id del curso.</div>'; return; }
   if (!getToken()) { fundaeConnect(); return; }
+  fundaeDiag = {};
+  fundaeLogVariant = null;
   out.innerHTML = '<div class="card fp-card"><div class="card-body" style="text-align:center;padding:48px 20px;">' +
     '<div class="spinner-border text-primary" role="status" style="margin-bottom:10px;"></div>' +
     '<div class="fp-muted" id="fp-progress">Consultando API y registros del curso…</div></div></div>';
@@ -574,9 +649,11 @@ function fundaeRun() {
       var done = 0;
       var pStudents = fundaePool(sample, CONCURRENCIA, function (u) {
         var pCourse = ws('core_completion_get_course_completion_status', { courseid: courseid, userid: u.id })
-          .then(function (r) { return r.completionstatus; }).catch(function () { return null; });
+          .then(function (r) { return r.completionstatus; })
+          .catch(function (e) { if (!fundaeDiag.course) fundaeDiag.course = e.message; return null; });
         var pActs = ws('core_completion_get_activities_completion_status', { courseid: courseid, userid: u.id })
-          .then(function (r) { return r.statuses || []; }).catch(function () { return null; });
+          .then(function (r) { return r.statuses || []; })
+          .catch(function (e) { if (!fundaeDiag.acts) fundaeDiag.acts = e.message; return null; });
         var pLogs = fundaeLogRows(courseid, u.id);
         return Promise.all([pCourse, pActs, pLogs]).then(function (pr) {
           done++;
@@ -801,9 +878,15 @@ function fundaeRender() {
     ['Alumnos matriculados', s.nStudents > 0, s.nStudents + ' alumnos'],
     ['Trazabilidad: alumnos con acceso al curso', s.pctAccess === 100 ? true : (s.pctAccess >= 75 ? 'warn' : false), s.pctAccess + '% (' + s.nAcc + '/' + s.nStudents + ')'],
     ['Tiempos de conexión calculados desde los registros', s.timeTracking ? true : 'warn',
-      s.timeTracking ? 'Total del grupo: ' + fmtDur(s.totalTime) + ' (sesiones con corte a ' + SESSION_GAP_MIN + ' min de inactividad)'
-                     : 'Sin acceso a los registros: el usuario que ve la página necesita el permiso report/log:view en el curso'],
-    ['Seguimiento de finalización activado', s.completionEnabled, s.completionEnabled ? 'Completion habilitado' : 'Sin datos de finalización (¿completion desactivado?)'],
+      s.timeTracking ? 'Total del grupo: ' + fmtDur(s.totalTime) + ' (sesiones con corte a ' + SESSION_GAP_MIN + ' min de inactividad' +
+                       (fundaeLogVariant === 'csv' ? '; registros leídos en CSV' : '') + ')'
+        : (fundaeDiag.log ? 'No se ha podido leer la descarga de registros. ' + diagTxt(fundaeDiag.log.msg) +
+            '. Causas habituales: falta el permiso report/log:view en el curso o no hay un lector de registros activo.'
+          : 'Sin acceso a los registros: el usuario que ve la página necesita el permiso report/log:view en el curso')],
+    ['Seguimiento de finalización activado', s.completionEnabled,
+      s.completionEnabled ? 'Completion habilitado'
+        : (fundaeDiag.course ? 'Sin datos de finalización del curso. ' + diagTxt(fundaeDiag.course)
+                             : 'Sin datos de finalización (¿completion desactivado?)')],
     ['Controles de aprendizaje (cuestionario/tarea)', s.nEval > 0, s.nEval + ' actividades evaluables'],
     ['Contenido SCORM cargado', s.nScorm > 0 ? true : 'warn',
       s.nScorm > 0 ? s.nScorm + ' paquete(s) SCORM, ' + s.scormGraded + ' con calificación configurada'
@@ -815,15 +898,19 @@ function fundaeRender() {
     ['Canal de interacción/tutoría (foro, chat, videoconf.)', s.hasForum, s.hasForum ? 'Detectado' : 'No encontrado'],
     ['Calificaciones registradas', s.anyGraded, s.anyGraded ? 'Hay notas en el libro de calificaciones' : 'Sin calificaciones todavía'],
     ['Alumnos con progreso ≥ 75 % de actividades', !s.pctTracking ? 'warn' : (s.nOver75 === s.nStudents ? true : (s.nOver75 > 0 ? 'warn' : false)),
-      s.pctTracking ? s.nOver75 + '/' + s.nStudents + ' alumnos' : 'Añadir core_completion_get_activities_completion_status al servicio para medirlo'],
+      s.pctTracking ? s.nOver75 + '/' + s.nStudents + ' alumnos'
+        : (fundaeDiag.acts ? diagTxt(fundaeDiag.acts) : 'Añadir core_completion_get_activities_completion_status al servicio para medirlo')],
     ['Alumnos con curso completado', s.pctDone === 100 ? true : (s.pctDone > 0 ? 'warn' : false), s.pctDone + '% (' + s.nDone + '/' + s.nStudents + ')'],
     ['Contenidos con finalización por vista', s.contTotal > 0 ? true : 'warn',
-      s.contTotal === null ? 'Añadir core_completion_get_activities_completion_status al servicio para medirlo'
+      s.contTotal === null ? (fundaeDiag.acts ? diagTxt(fundaeDiag.acts)
+                                              : 'Añadir core_completion_get_activities_completion_status al servicio para medirlo')
         : (s.contTotal > 0 ? s.contTotal + ' contenidos (archivos, libros, lecciones, SCORM…) se completan al verlos'
                            : 'Ningún contenido tiene configurada la finalización «ver»')],
     ['Mensajes del tutor a los alumnos', s.tutData && s.nStudents > 0 && s.nTutContact === s.nStudents ? true : 'warn',
       s.tutData ? s.nTutContact + '/' + s.nStudents + ' alumnos con al menos un mensaje del tutor (privado o respuesta en foro)'
-                : 'Añadir las funciones de mensajería y foros al servicio para medirlo']
+                : ((fundaeDiag.msgs || fundaeDiag.forum) ? diagTxt(fundaeDiag.msgs || fundaeDiag.forum) +
+                    ' (comprueba que las funciones de mensajería y foros estén en el servicio)'
+                  : 'Añadir las funciones de mensajería y foros al servicio para medirlo')]
   ];
   var nOk = checks.filter(function (ch) { return ch[1] === true; }).length;
   var checkRows = checks.map(function (ch, i) {
@@ -1207,7 +1294,8 @@ function fundaeRenderFundae() {
   });
   var filter = (document.getElementById('fp-ffilter') || {}).value || '';
   var fl = filter.toLowerCase();
-  var NO_LOG = 'Sin acceso a los registros: hace falta el permiso report/log:view en el curso';
+  var NO_LOG = fundaeDiag.log ? 'No se ha podido leer la descarga de registros: ' + fundaeDiag.log.msg
+                              : 'Sin acceso a los registros: hace falta el permiso report/log:view en el curso';
 
   function lnk(uid, html, title) {
     return '<a href="javascript:void(0)" class="fp-num-link" onclick="fundaeFToggle(' + uid + ')" title="' +
@@ -1298,7 +1386,8 @@ function fundaeDetailHtml(st) {
   var c = fundaeData.course;
   var sesHtml;
   if (st.sesList === null) {
-    sesHtml = '<p class="fp-muted">Sin acceso a los registros del curso (permiso report/log:view).</p>';
+    sesHtml = '<p class="fp-muted">' + (fundaeDiag.log ? 'No se ha podido leer la descarga de registros. ' + esc(diagTxt(fundaeDiag.log.msg)) + '.'
+                                                       : 'Sin acceso a los registros del curso (permiso report/log:view).') + '</p>';
   } else if (!st.sesList.length) {
     sesHtml = '<p class="fp-muted">El alumno no tiene eventos registrados en el curso.</p>';
   } else {

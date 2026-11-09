@@ -10,7 +10,34 @@ en uso (`panel-fundae.html`) es siempre la más reciente.
 
 ---
 
-## [3.1.0] — Informe de seguimiento FUNDAE (versión actual)
+## [3.1.1] — Lectura de registros más robusta y diagnóstico (versión actual)
+
+Archivo: [`versions/panel-fundae-v3.1.html`](versions/panel-fundae-v3.1.html)
+· también publicado como `panel-fundae.html`. Surge de la primera prueba en
+una plataforma real, donde el checklist indicaba «Sin acceso a los registros»
+sin más detalle.
+
+### Corregido
+- La descarga de registros ya no fuerza `logreader=logstore_standard`: usa el
+  lector que tenga activo la plataforma (`LOG_READER` vacío). Si los registros
+  se guardan en otro almacén, la v3.1.0 no podía leerlos.
+- Si la descarga JSON no se puede leer, el panel la pide en CSV. También
+  tolera la marca BOM y los avisos de PHP alrededor del JSON.
+- Tras dos alumnos sin poder leer los registros, deja de insistir con el resto.
+
+### Añadido
+- **Diagnóstico en el checklist.** Cuando una fuente falla, se muestra lo que
+  responde Moodle: registros, finalización del curso, finalización de las
+  actividades, mensajería y foros.
+
+### Verificación
+- Moodle simulado: 53 comprobaciones en seis escenarios (completo, sin
+  mensajería ni foros, lector de registros distinto, JSON roto, sin permiso de
+  registros y curso sin criterios de finalización).
+
+---
+
+## [3.1.0] — Informe de seguimiento FUNDAE
 
 Archivo: [`versions/panel-fundae-v3.1.html`](versions/panel-fundae-v3.1.html)
 · también publicado como `panel-fundae.html`. Versión menor: el modelo de

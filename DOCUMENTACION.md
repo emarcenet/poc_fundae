@@ -76,6 +76,7 @@ real. Estos son los hitos en orden:
 | 17 | Viabilidad en **Open LMS 5.1** (núcleo Moodle 5.1.4) | Verificado contra el código de MOODLE_501_STABLE |
 | 18 | **Informe de seguimiento FUNDAE** con las columnas del informe tipo | Sección adicional y detalle de sesiones con acumulado (v3.1) |
 | 19 | **Tiempos a cero**: la descarga JSON de registros llega anidada (`[[…]]`) | Resuelto: se aplana y la fecha se lee con el formato del idioma (v3.1) |
+| 20 | Primera prueba real: «Sin acceso a los registros» sin causa visible | Lector de registros no forzado, respaldo en CSV y diagnóstico con el mensaje de Moodle (v3.1.1) |
 
 Los hitos 1, 13 y 16 marcan los tres saltos de versión mayor; el 18, la versión
 menor 3.1 (ver §7).
@@ -270,6 +271,22 @@ para no confundir día y mes.
 respuestas privadas y borradas, chat y un mensaje anterior al curso: 39
 comprobaciones en dos escenarios (completo y sin mensajería ni foros). Falta
 la prueba en una plataforma real.
+
+### 5.9 Lectura de registros robusta y diagnóstico (v3.1.1)
+
+En la primera prueba real, el checklist marcaba «Sin acceso a los registros»
+mientras la API funcionaba. Según el código de `report/log` en 5.1, ese mismo
+síntoma tiene varias causas: falta de `report/log:view`, un lector de
+registros distinto de `logstore_standard` (el panel lo forzaba y Moodle no
+encuentra el lector), un formato de descarga que no se puede usar o salida
+previa que impide exportar. El profesor sin permiso de edición tiene
+`report/log:view` por defecto, pero no «Acceder a todos los grupos», lo que
+afecta a la finalización en cursos con grupos separados.
+
+Cambios: la descarga usa el lector activo de la plataforma, prueba JSON y CSV,
+tolera BOM y avisos de PHP, y el checklist muestra el mensaje de Moodle en
+cada fuente que falla. Se añadieron cuatro escenarios al Moodle simulado (53
+comprobaciones en total).
 
 ---
 

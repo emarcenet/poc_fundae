@@ -169,6 +169,8 @@ con esa opción activada.
 | «No tiene permiso…» en una función concreta | Al tutor le falta esa capacidad en el curso (p. ej. ver finalización) | Revisar su rol en el curso |
 | «n/d» en Mensajes tutor *(v3.1)* | Faltan las funciones de mensajería o de foros en el servicio | Paso 2: añadir las funciones nuevas de la v3.1 |
 | «—» en Contenidos visualizados *(v3.1)* | Ningún contenido tiene la finalización «ver» configurada | Configurar la finalización por vista en archivos, libros, lecciones, SCORM… |
+| «Atención» en Tiempos de conexión con «Moodle responde: …» *(v3.1.1)* | La descarga de registros devuelve una página de error | Leer el mensaje: permiso `report/log:view` en el curso, lector de registros, sesión caducada… |
+| Sin datos de finalización con un profesor sin permiso de edición | El curso está en grupos separados y ese rol no tiene «Acceder a todos los grupos» (`moodle/site:accessallgroups`) | Añadir al tutor a los grupos de sus alumnos o concederle ese permiso en el curso |
 
 ## Comprobaciones incluidas en la PoC
 
@@ -230,6 +232,7 @@ mensajes.
 ### Ajustes al inicio del script
 
 - `SESSION_GAP_MIN`: minutos de inactividad que cierran una sesión (30).
+- `LOG_READER`: lector de registros de la descarga. Vacío (por defecto) = el que tenga activo la plataforma *(v3.1.1)*.
 - `ROLES_TUTOR`: roles que cuentan como tutor en los foros (`editingteacher`, `teacher`). El tutor conectado cuenta siempre.
 - `EXCLUIR_CONTENIDOS`: tipos que nunca cuentan como contenido (`label`, `subsection`, `qbank`).
 - `CONTAR_RESPUESTAS_FORO`: `true` suma las respuestas en foros a «Mensajes tutor»; `false` cuenta solo los mensajes privados.
@@ -337,6 +340,9 @@ Notas:
   cero. La v3.1 aplana la lista y lee la hora con el formato de fecha del
   idioma del tutor (`strftimedatetimeshortaccurate`, obtenido con
   `core_get_string`), para no confundir día y mes en idiomas como `en_us`.
+- **Lector y formato (v3.1.1).** La descarga usa el lector de registros que
+  tenga activo la plataforma y, si el JSON falla, el CSV. Si aun así no se
+  puede leer, el checklist muestra lo que responde Moodle.
 - Si la columna «Tiempo en curso» muestra **n/d**, el usuario que ve la página
   no tiene `report/log:view` en el curso, o el formato de descarga JSON está
   deshabilitado (Administración del sitio → Extensiones → Formatos de datos).
