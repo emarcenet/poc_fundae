@@ -170,6 +170,8 @@ con esa opción activada.
 | «n/d» en Mensajes tutor *(v3.1)* | Faltan las funciones de mensajería o de foros en el servicio | Paso 2: añadir las funciones nuevas de la v3.1 |
 | «—» en Contenidos visualizados *(v3.1)* | Ningún contenido tiene la finalización «ver» configurada | Configurar la finalización por vista en archivos, libros, lecciones, SCORM… |
 | «Atención» en Tiempos de conexión con «Moodle responde: …» *(v3.1.1)* | La descarga de registros devuelve una página de error | Leer el mensaje: permiso `report/log:view` en el curso, lector de registros, sesión caducada… |
+| «Moodle responde: «[]]»» *(v3.1.1; resuelto en la v3.1.2)* | El alumno no tiene eventos en los registros del curso: es la salida de Moodle sin filas | Actualizar a la v3.1.2, que lo lee como cero eventos |
+| «La descarga de registros funciona, pero no hay eventos de ningún alumno» *(v3.1.2)* | Los alumnos no han entrado en el curso, la plataforma ya ha borrado los registros o el lector activo no los guarda | Comprobar con una cuenta de alumno; revisar «Conservar registros durante» en el registro estándar |
 | Sin datos de finalización con un profesor sin permiso de edición | El curso está en grupos separados y ese rol no tiene «Acceder a todos los grupos» (`moodle/site:accessallgroups`) | Añadir al tutor a los grupos de sus alumnos o concederle ese permiso en el curso |
 
 ## Comprobaciones incluidas en la PoC

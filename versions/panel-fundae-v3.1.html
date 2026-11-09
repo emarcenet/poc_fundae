@@ -29,7 +29,7 @@
  * defecto (se borra al cerrar) o localStorage si marca «Recordar» — y
  * consulta la API con sus propios permisos: si se filtra, no concede
  * más acceso del que ese tutor ya tiene. */
-var PANEL_VERSION = '3.1.1';
+var PANEL_VERSION = '3.1.2';
 var TOKEN_KEY = 'fundae_wstoken';
 var SERVICE_NAME = 'FUNDAE PoC'; // nombre del servicio externo en Moodle
 var MAX_ALUMNOS = 100;     // límite de alumnos consultados en la PoC
@@ -340,8 +340,12 @@ var LOG_FORMATOS = ['json', 'csv'];
 // recorría el nivel exterior y no leía ninguna hora. Aquí se aplana antes.
 function fundaeParseDownload(txt, format) {
   txt = String(txt || '');
-  if (txt.charCodeAt(0) === 0xFEFF) txt = txt.slice(1); // marca BOM
+  var hadBom = txt.charCodeAt(0) === 0xFEFF;
+  if (hadBom) txt = txt.slice(1); // marca BOM
   if (format === 'json') {
+    // Sin filas, Moodle cierra una hoja que nunca abrió y escribe «[]]»
+    // (JSON no válido). No es un error: el alumno no tiene eventos.
+    if (/^\s*\[\s*\]\s*\]?\s*$/.test(txt)) return [];
     var data = null;
     try { data = JSON.parse(txt); } catch (e) {
       // Tolera avisos de PHP o espacios antes o después del JSON.
@@ -355,6 +359,7 @@ function fundaeParseDownload(txt, format) {
   }
   // CSV (RFC 4180): comillas, comas y saltos de línea dentro de los campos.
   if (/^\s*</.test(txt)) return null; // es una página HTML, no datos
+  if (hadBom && !txt.trim()) return [];  // CSV sin filas: Moodle solo escribe la marca BOM
   var out = [], row = [], field = '', q = false;
   for (var i = 0; i < txt.length; i++) {
     var ch = txt.charAt(i);
@@ -725,7 +730,10 @@ function fundaeBuild(course, rawStudents, perStudent, contents, grades, extras) 
 
   var students = perStudent.map(function (ps) {
     var u = ps.user;
-    var last = u.lastcourseaccess || u.lastaccess || 0;
+    // Acceso al CURSO (trazabilidad FUNDAE). Hasta la v3.1.1 se usaba el último
+    // acceso a la plataforma como respaldo, y un alumno que nunca había entrado
+    // en el curso contaba como «ha accedido».
+    var last = (u.lastcourseaccess !== undefined ? u.lastcourseaccess : u.lastaccess) || 0;
     var pct = null;
     if (ps.actstatuses && ps.actstatuses.length) {
       var done = ps.actstatuses.filter(function (s) { return s.state === 1 || s.state === 2; }).length;
@@ -815,6 +823,8 @@ function fundaeBuild(course, rawStudents, perStudent, contents, grades, extras) 
   var nOver75 = students.filter(function (s) { return s.pct !== null && s.pct >= 75; }).length;
   var timeTracking = students.some(function (s) { return s.time !== null; });
   var totalTime = students.reduce(function (acc, s) { return acc + (s.time || 0); }, 0);
+  // La descarga funciona pero ningún alumno tiene eventos en los registros del curso.
+  var logsEmpty = timeTracking && !students.some(function (s) { return s.sesList && s.sesList.length; });
   var contRef = students.filter(function (s) { return s.cont; })[0];
   var contTotal = contRef ? contRef.cont.total : null;
   var tutData = students.some(function (s) { return s.tutTotal !== null; });
@@ -831,7 +841,7 @@ function fundaeBuild(course, rawStudents, perStudent, contents, grades, extras) 
     timeTracking: timeTracking, totalTime: totalTime,
     nScorm: scorm.items.length, scormGraded: scorm.nGraded,
     nGradableActs: nGradableActs, nGradedActs: nGradedActs,
-    contTotal: contTotal, tutData: tutData, nTutContact: nTutContact
+    contTotal: contTotal, tutData: tutData, nTutContact: nTutContact, logsEmpty: logsEmpty
   };
   fundaeRender();
 }
@@ -877,8 +887,11 @@ function fundaeRender() {
     ['Curso con fechas de inicio y fin', hasDates, 'Inicio: ' + fmtDate(c.startdate) + ' · Fin: ' + fmtDate(c.enddate)],
     ['Alumnos matriculados', s.nStudents > 0, s.nStudents + ' alumnos'],
     ['Trazabilidad: alumnos con acceso al curso', s.pctAccess === 100 ? true : (s.pctAccess >= 75 ? 'warn' : false), s.pctAccess + '% (' + s.nAcc + '/' + s.nStudents + ')'],
-    ['Tiempos de conexión calculados desde los registros', s.timeTracking ? true : 'warn',
-      s.timeTracking ? 'Total del grupo: ' + fmtDur(s.totalTime) + ' (sesiones con corte a ' + SESSION_GAP_MIN + ' min de inactividad' +
+    ['Tiempos de conexión calculados desde los registros', s.timeTracking && !s.logsEmpty ? true : 'warn',
+      s.logsEmpty ? 'La descarga de registros funciona, pero no hay eventos de ningún alumno en este curso. ' +
+                    'Si ya han entrado, revisa cuánto tiempo conserva la plataforma los registros ' +
+                    '(Registro estándar → «Conservar registros durante») y qué lector de registros está activo.'
+      : s.timeTracking ? 'Total del grupo: ' + fmtDur(s.totalTime) + ' (sesiones con corte a ' + SESSION_GAP_MIN + ' min de inactividad' +
                        (fundaeLogVariant === 'csv' ? '; registros leídos en CSV' : '') + ')'
         : (fundaeDiag.log ? 'No se ha podido leer la descarga de registros. ' + diagTxt(fundaeDiag.log.msg) +
             '. Causas habituales: falta el permiso report/log:view en el curso o no hay un lector de registros activo.'

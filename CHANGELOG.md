@@ -10,7 +10,34 @@ en uso (`panel-fundae.html`) es siempre la más reciente.
 
 ---
 
-## [3.1.1] — Lectura de registros más robusta y diagnóstico (versión actual)
+## [3.1.2] — Registros vacíos y acceso al curso (versión actual)
+
+Archivo: [`versions/panel-fundae-v3.1.html`](versions/panel-fundae-v3.1.html)
+· también publicado como `panel-fundae.html`. Surge de la segunda prueba real,
+en la que el diagnóstico de la v3.1.1 mostró «Moodle responde: «[]]»».
+
+### Corregido
+- **Descarga sin filas.** Cuando un alumno no tiene eventos, Moodle 5.1 cierra
+  una hoja que nunca abrió y escribe «[]]», que no es JSON válido; en CSV solo
+  escribe la marca BOM. El panel lo trataba como un error («No se ha podido
+  leer la descarga»). Ahora lo lee como cero eventos.
+- **Trazabilidad.** «Han accedido» y el último acceso usan solo el acceso al
+  curso (`lastcourseaccess`). Hasta ahora se usaba como respaldo el último
+  acceso a la plataforma, y un alumno que nunca había entrado en el curso
+  contaba como «ha accedido».
+
+### Añadido
+- Aviso en el checklist cuando la descarga funciona pero ningún alumno tiene
+  eventos en el curso, con las causas que hay que revisar (alumnos que no han
+  entrado, retención de registros o lector activo).
+
+### Verificación
+- El Moodle simulado devuelve ahora la salida real de Moodle sin filas («[]]»
+  y BOM). 57 comprobaciones en siete escenarios.
+
+---
+
+## [3.1.1] — Lectura de registros más robusta y diagnóstico
 
 Archivo: [`versions/panel-fundae-v3.1.html`](versions/panel-fundae-v3.1.html)
 · también publicado como `panel-fundae.html`. Surge de la primera prueba en

@@ -77,6 +77,7 @@ real. Estos son los hitos en orden:
 | 18 | **Informe de seguimiento FUNDAE** con las columnas del informe tipo | Sección adicional y detalle de sesiones con acumulado (v3.1) |
 | 19 | **Tiempos a cero**: la descarga JSON de registros llega anidada (`[[…]]`) | Resuelto: se aplana y la fecha se lee con el formato del idioma (v3.1) |
 | 20 | Primera prueba real: «Sin acceso a los registros» sin causa visible | Lector de registros no forzado, respaldo en CSV y diagnóstico con el mensaje de Moodle (v3.1.1) |
+| 21 | Segunda prueba real: el diagnóstico muestra «[]]» | Es la salida de Moodle sin filas; se lee como cero eventos y la trazabilidad pasa a usar solo el acceso al curso (v3.1.2) |
 
 Los hitos 1, 13 y 16 marcan los tres saltos de versión mayor; el 18, la versión
 menor 3.1 (ver §7).
@@ -287,6 +288,21 @@ Cambios: la descarga usa el lector activo de la plataforma, prueba JSON y CSV,
 tolera BOM y avisos de PHP, y el checklist muestra el mensaje de Moodle en
 cada fuente que falla. Se añadieron cuatro escenarios al Moodle simulado (53
 comprobaciones en total).
+
+### 5.10 Registros vacíos y acceso al curso (v3.1.2)
+
+Con la v3.1.1, el diagnóstico de la segunda prueba real mostró «[]]». Según el
+código de la exportación de tablas en 5.1, cuando no hay filas la descarga
+escribe la apertura del documento, pero nunca la cabecera de la hoja; al
+cerrar, cierra la hoja y el documento: `[` + `]` + `]`. Es decir, la descarga
+funcionaba y el alumno no tenía eventos en el curso. La v3.1.2 lo lee como
+cero eventos y avisa si ningún alumno tiene registros.
+
+Se corrigió además un fallo heredado: la trazabilidad usaba como respaldo el
+último acceso a la plataforma, de modo que un alumno que no había entrado en
+el curso contaba como «ha accedido». Ahora solo cuenta el acceso al curso.
+Lección para las pruebas: el Moodle simulado debe reproducir también las
+salidas vacías reales, no solo las respuestas con datos.
 
 ---
 
